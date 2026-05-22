@@ -35,7 +35,7 @@ function AI_webhook_transcription_index($params)
         $last = end($chunk);
         $start = $first['start'];
         $end = $last['end'];
-        $LLM = new AI_LLM_OpenAI();
+        $LLM = new AI_LLM_Openai();
         $results = $LLM->summarize($source);
         $keywords = $LLM->keywords($results['keywords']);
         $s = floor($start / 1000);

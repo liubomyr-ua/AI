@@ -332,6 +332,120 @@ abstract class AI_LLM implements AI_LLM_Interface
         return null;
     }
 
+    /**
+     * Route to an LLM adapter by deployment-configured route name.
+     *
+     * Deployments configure an "AI/llm/routes" map (route name -> provider name)
+     * and "AI/llm/providers" map (provider name -> { class, config }).
+     * This method resolves a route name to an adapter instance.
+     *
+     * Example config:
+     *   AI: {
+     *     llm: {
+     *       default: "anthropic-direct",
+     *       providers: {
+     *         "anthropic-direct": { class: "Anthropic", config: {...} },
+     *         "anthropic-bedrock": { class: "Aws", config: {...} },
+     *         "anthropic-vertex": { class: "VertexAi", config: {...} },
+     *         "openai-direct": { class: "Openai", config: {...} },
+     *         "openai-azure": { class: "AzureOpenai", config: {...} },
+     *         "llama-local-vllm": { class: "Local", config: { subtype: "vllm", ... } }
+     *       },
+     *       routes: {
+     *         smart: "anthropic-direct",
+     *         "smart-cached": "llama-local-vllm",
+     *         fast: "openai-direct",
+     *         vision: "anthropic-direct"
+     *       }
+     *     }
+     *   }
+     *
+     * Usage:
+     *   $llm = AI_LLM::route('smart');
+     *   $llm = AI_LLM::route('smart-cached');  // returns an Advanced-capable instance
+     *
+     * Unknown route falls back to AI/llm/default. If that's also missing,
+     * falls back to the first provider in AI/llm/providers. If even that
+     * is missing, returns null.
+     *
+     * @method route
+     * @static
+     * @param {string} $routeName  Route name e.g. 'smart', 'fast', 'vision', 'smart-cached'
+     * @param {array}  [$options]  Additional options forwarded to the adapter constructor
+     * @return {AI_LLM|null}       Adapter instance, or null if no provider resolves
+     */
+    public static function route($routeName, array $options = array())
+    {
+        $routes    = Q_Config::get(array('AI', 'llm', 'routes'), array());
+        $providers = Q_Config::get(array('AI', 'llm', 'providers'), array());
+        $default   = Q_Config::get(array('AI', 'llm', 'default'), null);
+
+        // 1. Resolve route name to provider name.
+        $providerName = null;
+        if (is_array($routes) && isset($routes[$routeName])) {
+            $providerName = $routes[$routeName];
+        } elseif ($default) {
+            $providerName = $default;
+        } elseif (is_array($providers) && !empty($providers)) {
+            $names = array_keys($providers);
+            $providerName = reset($names);
+        }
+        if (!$providerName) {
+            return null;
+        }
+
+        // 2. Resolve provider name to class + config.
+        $providerDef = null;
+        if (is_array($providers) && isset($providers[$providerName])) {
+            $providerDef = $providers[$providerName];
+        } else {
+            // No provider definition — treat providerName as a direct adapter class.
+            return self::create($providerName, $options);
+        }
+
+        $className = isset($providerDef['class']) ? $providerDef['class'] : null;
+        if (!$className) {
+            return null;
+        }
+
+        // 3. Merge provider config with caller options. Caller options win.
+        $mergedOptions = array();
+        if (isset($providerDef['config']) && is_array($providerDef['config'])) {
+            $mergedOptions = $providerDef['config'];
+        }
+        $mergedOptions = array_replace($mergedOptions, $options);
+
+        // 4. Instantiate.
+        return self::create($className, $mergedOptions);
+    }
+
+    /**
+     * List all configured route names.
+     *
+     * @method listRoutes
+     * @static
+     * @return {array}  array of route names
+     */
+    public static function listRoutes()
+    {
+        $routes = Q_Config::get(array('AI', 'llm', 'routes'), array());
+        return is_array($routes) ? array_keys($routes) : array();
+    }
+
+    /**
+     * List all configured provider names.
+     *
+     * @method listProviders
+     * @static
+     * @return {array}  array of provider names
+     */
+    public static function listProviders()
+    {
+        $providers = Q_Config::get(array('AI', 'llm', 'providers'), array());
+        return is_array($providers) ? array_keys($providers) : array();
+    }
+
+
 	/**
 	 * Build prompt clauses and JSON schema from observation definitions.
 	 *

@@ -143,7 +143,7 @@ function AI_discourse_post()
 		));
 	}
 
-	$LLM = new AI_LLM_OpenAI();
+	$LLM = new AI_LLM_Openai();
 
 	$prompt =
 		"You are a forum member writing a thoughtful reply.\n\n" .

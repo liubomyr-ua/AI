@@ -1,0 +1,228 @@
+{
+	"AI": {
+		"_comment": "Example deployment config showing AI plugin routing setup. Copy relevant sections into your environment-specific config. Adapters are loaded by class name (string), so 'Anthropic' resolves to AI_LLM_Anthropic.php / AI/LLM/Anthropic.js.",
+
+		"llm": {
+			"_comment": "LLM routing. Consumers call AI_LLM::route('smart') (PHP) or AI_LLM.route('smart') (JS). Route names are deployment conventions; the canonical set is suggested below but you can add your own.",
+
+			"default": "anthropic-direct",
+
+			"providers": {
+				"anthropic-direct": {
+					"class": "Anthropic",
+					"config": {
+						"_comment": "Direct api.anthropic.com. Best when running off-AWS. Apikey/baseUrl/version/model can be set here or in AI/anthropic/*.",
+						"model": "claude-sonnet-4-6"
+					}
+				},
+				"anthropic-bedrock": {
+					"class": "Aws",
+					"config": {
+						"_comment": "Anthropic via AWS Bedrock. Use when deployed on AWS with IAM-based auth. Region from AI/aws/region.",
+						"model": "anthropic.claude-3-sonnet-20240229-v1:0"
+					}
+				},
+				"anthropic-vertex": {
+					"class": "VertexAi",
+					"config": {
+						"_comment": "Anthropic via Google Vertex. Use when deployed on GCP. credentialsPath='metadata' uses Workload Identity.",
+						"model": "publishers/anthropic/models/claude-sonnet-4-5"
+					}
+				},
+				"openai-direct": {
+					"class": "Openai",
+					"config": {
+						"_comment": "Direct api.openai.com.",
+						"model": "gpt-4.1-mini"
+					}
+				},
+				"gemini-aistudio": {
+					"class": "Google",
+					"config": {
+						"_comment": "Google AI Studio Gemini API (simple API key).",
+						"model": "models/gemini-1.5-flash"
+					}
+				},
+				"gemini-vertex": {
+					"class": "VertexAi",
+					"config": {
+						"_comment": "Gemini via Vertex AI (service account auth).",
+						"model": "publishers/google/models/gemini-2.5-pro"
+					}
+				},
+				"llama-vertex": {
+					"class": "VertexAi",
+					"config": {
+						"_comment": "Llama on Vertex (OpenAI-compat endpoint).",
+						"model": "publishers/meta/models/llama-3.3-70b-instruct"
+					}
+				},
+				"llama-vllm-local": {
+					"class": "Local",
+					"config": {
+						"_comment": "Production-grade local serving with native prefix caching.",
+						"subtype": "vllm",
+						"url": "http://localhost:8000",
+						"model": "meta-llama/Llama-3.3-70B-Instruct"
+					}
+				},
+				"llama-cpp-local": {
+					"class": "Local",
+					"config": {
+						"_comment": "llama-cpp-server with KV slot reuse for explicit cache control.",
+						"subtype": "llama-cpp",
+						"url": "http://localhost:8080",
+						"model": "default"
+					}
+				},
+				"ollama-local": {
+					"class": "Local",
+					"config": {
+						"_comment": "Casual local. No prefix caching; keep-alive for warmup only.",
+						"subtype": "ollama",
+						"url": "http://localhost:11434",
+						"model": "llama3.3"
+					}
+				}
+			},
+
+			"routes": {
+				"_comment": "Logical route -> provider. Consumers ask for 'smart' / 'fast' / 'vision' / etc.; this map decides the actual backend at deployment time. Override per deployment.",
+
+				"smart":         "anthropic-direct",
+				"smart-cached":  "anthropic-direct",
+				"smart-local":   "llama-vllm-local",
+				"fast":          "openai-direct",
+				"vision":        "anthropic-direct",
+				"long-context":  "gemini-vertex",
+				"cheap":         "ollama-local",
+				"reasoning":     "anthropic-direct"
+			},
+
+			"models": {
+				"_comment": "Default model name per provider class (used if not overridden in providers.*.config.model).",
+				"openai":    "gpt-4.1-mini",
+				"anthropic": "claude-sonnet-4-6",
+				"google":    "models/gemini-1.5-flash",
+				"aws":       "anthropic.claude-3-sonnet-20240229-v1:0",
+				"vertex":    "publishers/google/models/gemini-2.5-flash",
+				"local":     "default"
+			},
+
+			"maxTokens": 4096
+		},
+
+		"anthropic": {
+			"_comment": "Direct Anthropic settings. apiKey is required; baseUrl/version have sensible defaults.",
+			"apiKey":  "sk-ant-...",
+			"baseUrl": "https://api.anthropic.com",
+			"version": "2023-06-01"
+		},
+
+		"vertex": {
+			"_comment": "Vertex AI settings. credentialsPath options: path to service account JSON, or 'metadata' for Workload Identity on GKE/Cloud Run.",
+			"projectId":       "your-gcp-project",
+			"location":        "us-central1",
+			"credentialsPath": "/etc/secrets/vertex-sa.json"
+		},
+
+		"local": {
+			"_comment": "Local LLM serving. allowedHosts whitelists which hosts AI_LLM_Local will connect to (SSRF guard).",
+			"url":          "http://localhost:8000",
+			"apiKey":       "sk-local-dummy",
+			"subtype":      "vllm",
+			"model":        "meta-llama/Llama-3.3-70B-Instruct",
+			"allowedHosts": ["localhost", "127.0.0.1", "::1", "gpu.internal"]
+		},
+
+		"openAI": {
+			"_comment": "Existing OpenAI settings consumed by AI_LLM_Openai.",
+			"key": "sk-...",
+			"url": "https://api.openai.com/v1/responses"
+		},
+
+		"google": {
+			"_comment": "AI Studio Gemini (different from Vertex).",
+			"api_key":      "AIza...",
+			"llm_model":    "models/gemini-1.5-flash"
+		},
+
+		"aws": {
+			"_comment": "AWS Bedrock. region is required by the SDK; credentials via IAM role or env vars.",
+			"region":       "us-east-1",
+			"llm_model_id": "anthropic.claude-3-sonnet-20240229-v1:0"
+		},
+
+
+		"voice": {
+			"_comment": "Realtime voice routing. Same routes-of-providers pattern as LLM. See AI/Voice/<Provider>.php for adapters.",
+
+			"default": "openai-realtime",
+
+			"providers": {
+				"openai-realtime": {
+					"class": "Openai",
+					"config": {
+						"model": "gpt-realtime-2",
+						"voice": "alloy",
+						"audioFormat": "pcm16",
+						"sampleRate":  24000
+					}
+				},
+				"azure-openai-realtime": {
+					"class": "AzureOpenai",
+					"config": {
+						"_comment": "Azure OpenAI Realtime. Set AI/azureOpenai/* for endpoint+deployment+apiKey.",
+						"deployment": "gpt-realtime",
+						"voice":      "alloy"
+					}
+				},
+				"xai-grok-voice": {
+					"class": "Xai",
+					"config": {
+						"_comment": "xAI Grok Voice Think Fast 1.0. OpenAI-Realtime compatible wire format.",
+						"model": "grok-voice-think-fast-1.0",
+						"voice": "eve"
+					}
+				},
+				"gemini-live": {
+					"class": "Gemini",
+					"config": {
+						"_comment": "Gemini Live API. Server-to-server only; clients connect via proxy.",
+						"model":             "gemini-2.5-flash-native-audio-preview-12-2025",
+						"responseModalities":["AUDIO"]
+					}
+				},
+				"local-pipecat": {
+					"class": "Local",
+					"config": {
+						"_comment": "Local Pipecat / LiveKit Agents gateway. Adapter just returns a WebSocket URL.",
+						"url":         "ws://localhost:7860/pipecat",
+						"backendType": "pipecat"
+					}
+				}
+			},
+
+			"routes": {
+				"_comment": "Logical route -> provider. Consumers ask for 'conversational', 'reasoning', 'cheap', etc.",
+				"conversational":   "openai-realtime",
+				"reasoning":        "xai-grok-voice",
+				"multimodal-video": "gemini-live",
+				"local":            "local-pipecat",
+				"telephony":        "xai-grok-voice"
+			}
+		},
+
+		"xai": {
+			"_comment": "xAI settings (Grok Voice + LLM).",
+			"apiKey": "xai-..."
+		},
+
+		"azureOpenai": {
+			"_comment": "Azure OpenAI Service settings (used for both LLM and Voice Realtime).",
+			"endpoint":   "https://your-resource.openai.azure.com",
+			"apiKey":     "azure-key-...",
+			"apiVersion": "2024-10-01-preview"
+		}
+	}
+}

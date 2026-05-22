@@ -27,7 +27,7 @@ function AI_description_response_data()
 		return $stream->content;
 	}
 
-	$LLM = new AI_LLM_OpenAI();
+	$LLM = new AI_LLM_Openai();
 
 	$prompt =
 		"You are describing a specific item, object, or concept.\n\n" .

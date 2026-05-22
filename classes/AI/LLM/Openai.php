@@ -219,11 +219,27 @@ class AI_LLM_Openai extends AI_LLM implements AI_LLM_Interface
 			return false;
 		}
 
+		// Check if there's a transparent color index (for palette images)
 		if (imagecolortransparent($img) >= 0) {
 			return true;
 		}
 
-		return imagealphablending($img) === false;
+		// Scan pixels for alpha values
+		$width = imagesx($img);
+		$height = imagesy($img);
+
+		for ($x = 0; $x < $width; $x++) {
+			for ($y = 0; $y < $height; $y++) {
+				$rgba = imagecolorat($img, $x, $y);
+				$alpha = ($rgba & 0x7F000000) >> 24;
+
+				if ($alpha > 0) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	/**
