@@ -7,6 +7,6 @@ function AI_webhook_transcription_fetch_AssemblyAI($params)
     if (!$id || Q::ifset($_REQUEST, 'status', null) !== 'completed') {
         return '';
     }
-    $t = new AI_Transcription_AssemblyAI();
+    $t = new AI_Transcription_Assemblyai();
     return $t->fetch($id);
 }
