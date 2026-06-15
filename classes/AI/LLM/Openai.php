@@ -147,27 +147,38 @@ class AI_LLM_Openai extends AI_LLM implements AI_LLM_Interface
 		}
 
 		/**
-		 * Structured output support
+		 * Structured output support — Responses API.
+		 *
+		 * NOTE: the Responses API puts structured output under text.format,
+		 * flattened (no inner "json_schema" wrapper). The Chat Completions
+		 * "response_format" key is deprecated on this endpoint. strict mode
+		 * requires additionalProperties:false and every property in "required",
+		 * which AI_LLM::makeStrict() enforces recursively.
 		 */
 		$responseFormat = Q::ifset($options, 'response_format', null);
 		$jsonSchema = Q::ifset($options, 'json_schema', null);
 
 		if ($responseFormat === 'json_schema' && is_array($jsonSchema)) {
 
-			$payload['response_format'] = array(
-				'type' => 'json_schema',
-				'json_schema' => $jsonSchema
+			$payload['text'] = array(
+				'format' => array(
+					'type'   => 'json_schema',
+					'name'   => Q::ifset($options, 'schema_name', 'result'),
+					'strict' => true,
+					'schema' => AI_LLM::makeStrict($jsonSchema)
+				)
 			);
 
 		} elseif ($responseFormat === 'json') {
 
-			$payload['response_format'] = array(
-				'type' => 'json_object'
+			$payload['text'] = array(
+				'format' => array('type' => 'json_object')
 			);
 
-		} elseif (!empty($responseFormat)) {
+		} elseif (is_array($responseFormat)) {
 
-			$payload['response_format'] = $responseFormat;
+			// Allow callers to pass a fully-formed text.format object.
+			$payload['text'] = array('format' => $responseFormat);
 		}
 
 		$callback = Q::ifset($options, 'callback', null);
@@ -244,6 +255,12 @@ class AI_LLM_Openai extends AI_LLM implements AI_LLM_Interface
 
 	/**
 	 * Normalize OpenAI Responses output into semantic text.
+	 *
+	 * Handles structured-output refusals: when strict structured outputs are
+	 * enabled and the model declines, the Responses API returns a "refusal"
+	 * content block instead of "output_text". We surface that as an exception
+	 * rather than letting it silently become an empty string (which would then
+	 * look like a JSON parse failure downstream).
 	 */
 	protected function normalizeResponsesOutput(array $response)
 	{
@@ -265,9 +282,14 @@ class AI_LLM_Openai extends AI_LLM implements AI_LLM_Interface
 
 			foreach ($item['content'] as $block) {
 
+				$btype = isset($block['type']) ? $block['type'] : null;
+
+				if ($btype === 'refusal' && isset($block['refusal'])) {
+					throw new Exception("OpenAI model refused: " . $block['refusal']);
+				}
+
 				if (
-					isset($block['type']) &&
-					$block['type'] === 'output_text' &&
+					$btype === 'output_text' &&
 					isset($block['text']) &&
 					is_string($block['text'])
 				) {

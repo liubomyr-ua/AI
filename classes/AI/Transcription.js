@@ -1,113 +1,120 @@
 'use strict';
 /**
- * AI/Transcription — provider-agnostic transcription layer.
+ * AI/Transcription — provider-agnostic real-time speech-to-text layer.
  *
- * This file holds:
- *   - AI_Transcription class (base + factory)
- *   - AI_Transcription.prototype.poll() (retry helper for async adapters)
- *   - require hooks that load each adapter file so
- *     AI_Transcription.create('openai'|'xai'|'assemblyai'|'aws') works
- *     without the caller needing to preload anything.
+ * This file covers the SERVER-SIDE streaming interface used by socket.js
+ * when the host has an AI transcription provider configured.
+ * Direction: speech → text (STT). The inverse is AI/Voice (TTS).
  *
- * Mirrors the PHP filesystem layout:
- *   classes/AI/Transcription.php             (base + factory)
- *   classes/AI/Transcription/<Adapter>.php   (one per provider)
+ * This is distinct from the async-batch transcription adapters
+ * (AI/Transcription/Assemblyai, Openai-Whisper, Aws) which live in your
+ * main codebase and handle file-URL submissions with polling/webhook.
+ * Those are accessed via Protocol.Transcription in Safebox.
  *
- * Adapters:
- *   Openai      (sync, Whisper)
- *   Xai         (sync, Grok STT)
- *   Assemblyai  (async, webhook or poll)
- *   Aws         (async, poll)
+ * Streaming adapters (each in AI/classes/AI/Transcription/{Name}Stream.js):
+ *   DeepgramStream    — Deepgram wss://api.deepgram.com/v1/listen
+ *   AssemblyaiStream  — AssemblyAI wss://api.assemblyai.com/v2/realtime/ws
  *
- * ASYNC SEMANTICS
- * ---------------
- * Openai (Whisper) and Xai (Grok STT) are synchronous — transcribe() resolves
- * with the full text (and, for Xai, per-word timestamps + speaker diarization).
+ * Usage in socket.js:
+ *   var AI_Transcription = require('AI/Transcription');
+ *   var adapter = AI_Transcription.create(
+ *       Q.Config.get(['AI', 'transcription', 'provider'], 'deepgram')
+ *   );
+ *   adapter.open(session, {
+ *       onUtterance: function(chunk) { ... },
+ *       onError:     function(err)   { ... }
+ *   });
+ *   adapter.send(pcmBuffer);
+ *   adapter.close();
  *
- * AssemblyAI and AWS are async — transcribe() resolves with {id, status:'PROCESSING'}.
- * Callers have two options:
+ * Utterance chunk shape (passed to onUtterance):
+ *   { transcript, isFinal, confidence, speaker }
+ *   isFinal:false — interim result for live caption display
+ *   isFinal:true  — final result, fed into _onTranscript pipeline
  *
- *   Option A — Poll (simple, works for short audio):
- *     var job = await Transcription.transcribe(url, opts);
- *     var result = await Transcription.poll(job.id, opts);  // retries with sleep
- *
- *   Option B — Webhook (non-blocking, long audio):
- *     Pass opts.webhook = '<baseUrl>/Safebox/transcription/webhook'
- *     The provider POSTs back when done; Safebox updates the stream.
+ * Config keys:
+ *   AI/transcription/provider  — 'deepgram' | 'assemblyai' (default: 'deepgram')
+ *   AI/transcription/deepgram/key
+ *   AI/transcription/assemblyai/key
  *
  * @module AI
  */
 
-var Q = require('Q');
+// ── AI_Transcription streaming base ──────────────────────────────────────────
 
-// ── AI.Transcription base ─────────────────────────────────────────────────────
-
+/**
+ * Base class for all real-time streaming STT adapters.
+ * Do not instantiate directly — use AI_Transcription.create().
+ * @class AI_Transcription
+ * @constructor
+ */
 function AI_Transcription() {}
 module.exports = AI_Transcription;
 
 /**
- * Factory — mirrors PHP AI_Transcription::create().
+ * Factory. Returns a streaming adapter instance or null.
+ * Naming convention matches AI_Voice.create():
+ *   'deepgram'    → AI_Transcription.DeepgramStream
+ *   'assemblyai'  → AI_Transcription.AssemblyaiStream
+ *
+ * @method create
+ * @static
+ * @param {String|Object} adapter  Provider name or existing instance.
+ * @param {Object} [options]
+ * @return {AI_Transcription|null}
  */
 AI_Transcription.create = function (adapter, options) {
-	if (!adapter) return null;
-	if (typeof adapter === 'object') return adapter;
-	var s = adapter.replace(/[^a-z0-9]+/gi, ' ').trim();
-	// special-case 'assemblyai' → 'Assemblyai' not 'AssemblyAi'
-	var suffix = s.replace(/\s+(.)/g, function (_, c) { return c.toUpperCase(); });
-	suffix = suffix.charAt(0).toUpperCase() + suffix.slice(1);
-	var cls = AI_Transcription[suffix];
-	if (cls) return new cls(options);
-	return null;
-};
-
-AI_Transcription.prototype.transcribe = function (source, options) {
-	return Promise.resolve({ id: null, status: 'COMPLETED', text: '' });
-};
-AI_Transcription.prototype.fetch = function (transcriptId, options) {
-	return Promise.resolve({ id: transcriptId, status: 'NOT_FOUND' });
+    if (!adapter) return null;
+    if (typeof adapter === 'object') return adapter;
+    // 'deepgram' → 'DeepgramStream', 'assemblyai' → 'AssemblyaiStream'
+    // Append 'Stream' suffix to distinguish from async-batch adapters.
+    var s      = adapter.replace(/[^a-z0-9]+/gi, ' ').trim();
+    var suffix = s.replace(/\s+(.)/g, function (_, c) { return c.toUpperCase(); });
+    suffix     = suffix.charAt(0).toUpperCase() + suffix.slice(1) + 'Stream';
+    var cls    = AI_Transcription[suffix];
+    if (cls) return new cls(options);
+    return null;
 };
 
 /**
- * poll() — convenience wrapper for async adapters.
- * Retries fetch() with exponential backoff until COMPLETED or FAILED.
+ * Open a streaming transcription session.
+ * Called when the host starts the AI pipeline (AI/transcription/session/start).
  *
- * @param {string} transcriptId
- * @param {object} opts
- *   maxAttempts {number}  default 20
- *   intervalMs  {number}  initial poll interval ms, default 3000
- *   maxInterval {number}  max interval ms, default 15000
- * @return {Promise<{id, status, text?, words?, error?}>}
+ * @method open
+ * @param {Object} session  The session object from socket.js.
+ *   session.lang, session.sampleRate, session.userId are read.
+ * @param {Object} options
+ * @param {Function} options.onUtterance  Called with each transcript chunk.
+ *   Chunk shape: { transcript, isFinal, confidence, speaker }
+ * @param {Function} [options.onError]    Called with Error on connection failure.
+ * @param {Object}   options.Q            Server-side Q object for Config.
  */
-AI_Transcription.prototype.poll = function (transcriptId, opts) {
-	var self        = this;
-	opts            = opts || {};
-	var maxAttempts = opts.maxAttempts || 20;
-	var interval    = opts.intervalMs  || 3000;
-	var maxInterval = opts.maxInterval || 15000;
-	var attempts    = 0;
+AI_Transcription.prototype.open = function (session, options) {};
 
-	function _sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+/**
+ * Send a PCM audio buffer to the provider.
+ * Called for each AI/transcription/session/chunk event.
+ *
+ * @method send
+ * @param {Buffer|ArrayBuffer} pcmBuffer  Int16 linear PCM audio data.
+ */
+AI_Transcription.prototype.send = function (pcmBuffer) {};
 
-	function attempt() {
-		return self.fetch(transcriptId).then(function (result) {
-			if (result.status === 'COMPLETED' || result.status === 'FAILED') {
-				return result;
-			}
-			attempts++;
-			if (attempts >= maxAttempts) {
-				return { id: transcriptId, status: 'FAILED', error: 'poll timeout after ' + attempts + ' attempts' };
-			}
-			interval = Math.min(interval * 1.5, maxInterval);
-			return _sleep(interval).then(attempt);
-		});
-	}
-	return attempt();
-};
+/**
+ * Close the streaming session.
+ * Called on AI/transcription/session/stop, AI/transcription/session/abort,
+ * or socket disconnect.
+ *
+ * @method close
+ */
+AI_Transcription.prototype.close = function () {};
 
+/**
+ * @property platform
+ * @type {String|null}
+ */
 AI_Transcription.prototype.platform = null;
 
-// ── Auto-register all adapter files ───────────────────────────────────────────
-require('AI/Transcription/Openai');
-require('AI/Transcription/Assemblyai');
-require('AI/Transcription/Aws');
-require('AI/Transcription/Xai');
+// ── Auto-register streaming adapters ─────────────────────────────────────────
+require('./Transcription/DeepgramStream');
+require('./Transcription/AssemblyaiStream');

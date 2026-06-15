@@ -322,9 +322,114 @@ AI_LLM.promptFromObservations = function (observations) {
 };
 
 /**
+ * Build a real (strict-compatible) JSON Schema from observation definitions,
+ * for provider-native structured outputs. Mirrors PHP
+ * AI_LLM::jsonSchemaFromObservations(). Every field is required and nullable
+ * so the "Use null when uncertain" rule survives strict constrained decoding.
+ */
+AI_LLM.jsonSchemaFromObservations = function (observations) {
+	var properties = {};
+	Object.keys(observations).forEach(function (name) {
+		var o = observations[name];
+		if (!o.promptClause || !o.fieldNames) return;
+		var fieldProps = {};
+		o.fieldNames.forEach(function (field) {
+			var example = (o.example && Object.prototype.hasOwnProperty.call(o.example, field))
+				? o.example[field] : null;
+			fieldProps[field] = AI_LLM.schemaTypeFromExample(example);
+		});
+		properties[name] = {
+			type: 'object',
+			properties: fieldProps,
+			required: Object.keys(fieldProps),
+			additionalProperties: false
+		};
+	});
+	return {
+		type: 'object',
+		properties: properties,
+		required: Object.keys(properties),
+		additionalProperties: false
+	};
+};
+
+/**
+ * Infer a nullable JSON Schema type fragment from an example value.
+ * Mirrors PHP AI_LLM::schemaTypeFromExample().
+ */
+AI_LLM.schemaTypeFromExample = function (example) {
+	if (typeof example === 'boolean') {
+		return { type: ['boolean', 'null'] };
+	}
+	if (typeof example === 'number') {
+		return Number.isInteger(example)
+			? { type: ['integer', 'null'] }
+			: { type: ['number', 'null'] };
+	}
+	if (Array.isArray(example)) {
+		var first = example.length ? example[0] : null;
+		var itemType = (typeof first === 'number')
+			? (Number.isInteger(first) ? 'integer' : 'number')
+			: (typeof first === 'boolean' ? 'boolean' : 'string');
+		return { type: ['array', 'null'], items: { type: itemType } };
+	}
+	// string or unknown
+	return { type: ['string', 'null'] };
+};
+
+/**
+ * Normalise a JSON Schema for providers that require strict mode: sets
+ * additionalProperties:false on every object and forces "required" to list
+ * every property. Clones first so a caller-supplied schema isn't mutated.
+ * Mirrors PHP AI_LLM::makeStrict().
+ */
+AI_LLM.makeStrict = function (schema) {
+	if (!schema || typeof schema !== 'object') return schema;
+	schema = JSON.parse(JSON.stringify(schema)); // clone, don't mutate caller's
+	(function walk(s) {
+		if (!s || typeof s !== 'object') return;
+		if (s.type === 'object' && s.properties && typeof s.properties === 'object') {
+			s.additionalProperties = false;
+			s.required = Object.keys(s.properties);
+			Object.keys(s.properties).forEach(function (k) { walk(s.properties[k]); });
+		}
+		if (s.type === 'array' && s.items) {
+			walk(s.items);
+		}
+	})(schema);
+	return schema;
+};
+
+/**
+ * Sanitize a JSON Schema for Gemini's responseSchema field, which is an
+ * OpenAPI-subset rather than full JSON Schema. Strips additionalProperties
+ * recursively (Gemini's response is closed by construction, and older models /
+ * the v1beta endpoint reject the keyword) while preserving type (including
+ * nullable ["string","null"] unions), properties, required, items, enum and
+ * description. Use this instead of makeStrict() when targeting Gemini's
+ * responseSchema. Clones first so the caller's schema isn't mutated.
+ * Mirrors PHP AI_LLM::geminiSchema().
+ */
+AI_LLM.geminiSchema = function (schema) {
+	if (!schema || typeof schema !== 'object') return schema;
+	schema = JSON.parse(JSON.stringify(schema)); // clone, don't mutate caller's
+	(function walk(s) {
+		if (!s || typeof s !== 'object') return;
+		delete s.additionalProperties;
+		if (s.properties && typeof s.properties === 'object') {
+			Object.keys(s.properties).forEach(function (k) { walk(s.properties[k]); });
+		}
+		if (s.items) walk(s.items);
+	})(schema);
+	return schema;
+};
+
+/**
  * Run observation pipeline — one model call.
  * Mirrors PHP AI_LLM::process().
  * Pass options.webSearch to enable web search on supported adapters.
+ * Set options.structured (or config AI/llm/structuredOutputs) to engage
+ * provider-native structured outputs in addition to the in-prompt schema.
  */
 AI_LLM.prototype.process = function (inputs, observations, interpolate, options) {
 	if (!observations || !Object.keys(observations).length) return Promise.resolve({});
@@ -347,7 +452,23 @@ AI_LLM.prototype.process = function (inputs, observations, interpolate, options)
 			return Object.prototype.hasOwnProperty.call(interpolate, k) ? interpolate[k] : '';
 		});
 	}
-	return this.executeModel(prompt, inputs, Object.assign({}, options || {}))
+
+	options = Object.assign({}, options || {});
+
+	// Opt into provider-native structured outputs (constrained decoding) when
+	// enabled. Adapters translate response_format/json_schema into their own
+	// native field; ones that don't support it ignore these and fall back to
+	// the schema embedded in the prompt above.
+	var useStructured = (options.structured !== undefined)
+		? options.structured
+		: Q.Config.get(['AI', 'llm', 'structuredOutputs'], false);
+	if (useStructured && !options.json_schema) {
+		options.response_format = 'json_schema';
+		options.json_schema     = AI_LLM.jsonSchemaFromObservations(observations);
+		if (!options.schema_name) options.schema_name = 'observations';
+	}
+
+	return this.executeModel(prompt, inputs, options)
 		.then(function (raw) {
 			var text = typeof raw === 'string' ? raw : ((raw && raw.text) || '');
 			text = text.replace(/^```[a-z]*\n?|\n?```$/g, '').trim();

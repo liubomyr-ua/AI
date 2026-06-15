@@ -182,6 +182,9 @@ interface AI_LLM_Interface
 	 *   json_schema: object
 	 *     JSON schema definition when response_format = json_schema.
 	 *
+	 *   schema_name: string
+	 *     Optional name for the schema (used by providers that require one).
+	 *
 	 *   timeout: number
 	 *     Network timeout seconds.
 	 *
@@ -237,7 +240,10 @@ abstract class AI_LLM implements AI_LLM_Interface
 	 * @param {array} [$interpolate]
 	 *   Optional placeholder map passed to Q::interpolate()
      * @param {array} [$options]
-	 *   Options to pass to executeModel method
+	 *   Options to pass to executeModel method.
+	 *   Set $options['structured'] = true (or config AI/llm/structuredOutputs)
+	 *   to engage provider-native structured outputs instead of relying only
+	 *   on the schema embedded in the prompt.
 	 * @return {array}
 	 *   Observation JSON emitted by the model, or empty array if no observations passed.
 	 * @throws {Q_Exception}
@@ -272,6 +278,22 @@ abstract class AI_LLM implements AI_LLM_Interface
 
 		if (!empty($interpolate)) {
 			$prompt = Q::interpolate($prompt, $interpolate);
+		}
+
+		// Opt into provider-native structured outputs (constrained decoding)
+		// when enabled. Adapters translate response_format/json_schema into
+		// their own native field (OpenAI text.format, Anthropic output_config,
+		// etc.); adapters that don't support it ignore these options and fall
+		// back to the schema embedded in the prompt above. We only auto-set the
+		// schema when a caller hasn't already supplied one.
+		$useStructured = Q::ifset($options, 'structured',
+			Q_Config::get(array('AI', 'llm', 'structuredOutputs'), false));
+		if ($useStructured && !isset($options['json_schema'])) {
+			$options['response_format'] = 'json_schema';
+			$options['json_schema']     = self::jsonSchemaFromObservations($observations);
+			if (!isset($options['schema_name'])) {
+				$options['schema_name'] = 'observations';
+			}
 		}
 
 		return $this->_executeWithCallback($prompt, $inputs, $options, function ($raw) {
@@ -495,6 +517,145 @@ abstract class AI_LLM implements AI_LLM_Interface
 			'clauses' => $clauses,
 			'schema'  => $schema
 		);
+	}
+
+	/**
+	 * Build a real (strict-compatible) JSON Schema from observation definitions,
+	 * for provider-native structured outputs. Unlike promptFromObservations()
+	 * (which emits an example-shaped object for embedding in the prompt), this
+	 * emits a JSON Schema with types, "required", and additionalProperties:false.
+	 *
+	 * Every field is required and nullable (type union with "null"), which keeps
+	 * the "Use null when uncertain" rule working under strict constrained decoding.
+	 *
+	 * @method jsonSchemaFromObservations
+	 * @static
+	 * @param {array} $observations
+	 * @return {array} JSON Schema (associative array)
+	 */
+	static function jsonSchemaFromObservations(array $observations)
+	{
+		$properties = array();
+		foreach ($observations as $name => $o) {
+			if (empty($o['promptClause']) || empty($o['fieldNames'])) {
+				continue;
+			}
+			$fieldProps = array();
+			foreach ($o['fieldNames'] as $field) {
+				$example = (isset($o['example']) && array_key_exists($field, $o['example']))
+					? $o['example'][$field] : null;
+				$fieldProps[$field] = self::schemaTypeFromExample($example);
+			}
+			$properties[$name] = array(
+				'type'                 => 'object',
+				'properties'           => $fieldProps,
+				'required'             => array_keys($fieldProps),
+				'additionalProperties' => false
+			);
+		}
+
+		return array(
+			'type'                 => 'object',
+			'properties'           => $properties,
+			'required'             => array_keys($properties),
+			'additionalProperties' => false
+		);
+	}
+
+	/**
+	 * Infer a nullable JSON Schema type fragment from an example value.
+	 *
+	 * @method schemaTypeFromExample
+	 * @static
+	 * @param {mixed} $example
+	 * @return {array} JSON Schema fragment
+	 */
+	static function schemaTypeFromExample($example)
+	{
+		if (is_bool($example)) {
+			return array('type' => array('boolean', 'null'));
+		}
+		if (is_int($example)) {
+			return array('type' => array('integer', 'null'));
+		}
+		if (is_float($example)) {
+			return array('type' => array('number', 'null'));
+		}
+		if (is_array($example)) {
+			// Infer item type from the first element; default to string.
+			$first = reset($example);
+			$itemType = is_int($first) ? 'integer'
+				: (is_float($first) ? 'number'
+				: (is_bool($first) ? 'boolean' : 'string'));
+			return array(
+				'type'  => array('array', 'null'),
+				'items' => array('type' => $itemType)
+			);
+		}
+		// string or unknown
+		return array('type' => array('string', 'null'));
+	}
+
+	/**
+	 * Normalize a JSON Schema for providers that require strict mode:
+	 * sets additionalProperties:false on every object and forces "required"
+	 * to list every property (optionality is expressed via nullable type unions).
+	 * Recurses into nested objects and array items.
+	 *
+	 * @method makeStrict
+	 * @static
+	 * @param {mixed} $schema
+	 * @return {mixed}
+	 */
+	static function makeStrict($schema)
+	{
+		if (!is_array($schema)) {
+			return $schema;
+		}
+		$type = isset($schema['type']) ? $schema['type'] : null;
+
+		if ($type === 'object' && isset($schema['properties']) && is_array($schema['properties'])) {
+			$schema['additionalProperties'] = false;
+			$schema['required'] = array_keys($schema['properties']);
+			foreach ($schema['properties'] as $k => $v) {
+				$schema['properties'][$k] = self::makeStrict($v);
+			}
+		}
+		if ($type === 'array' && isset($schema['items'])) {
+			$schema['items'] = self::makeStrict($schema['items']);
+		}
+		return $schema;
+	}
+
+	/**
+	 * Sanitize a JSON Schema for Gemini's responseSchema field, which is an
+	 * OpenAPI-subset rather than full JSON Schema. Strips additionalProperties
+	 * recursively (Gemini's response is closed by construction, and older
+	 * models / the v1beta endpoint reject the keyword) while preserving type
+	 * (including nullable ["string","null"] unions), properties, required,
+	 * items, enum and description. Use this instead of makeStrict() when
+	 * targeting Gemini's responseSchema.
+	 *
+	 * @method geminiSchema
+	 * @static
+	 * @param {mixed} $schema
+	 * @return {mixed}
+	 */
+	static function geminiSchema($schema)
+	{
+		if (!is_array($schema)) {
+			return $schema;
+		}
+		unset($schema['additionalProperties']);
+		if (isset($schema['properties']) && is_array($schema['properties'])) {
+			foreach ($schema['properties'] as $k => $v) {
+				$schema['properties'][$k] = self::geminiSchema($v);
+			}
+		}
+		if (isset($schema['items'])) {
+			$schema['items'] = self::geminiSchema($schema['items']);
+		}
+		return $schema;
 	}
 
     /**

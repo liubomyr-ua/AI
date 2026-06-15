@@ -1,5 +1,12 @@
 {
     "Streams/image": {
+        "describe": {
+            "basic": {
+                "promptClause": "Describe only what is visibly present. Provide a 'title' of at most 3 words naming the concrete main subject, and a 'content' description of one or two plain sentences, at most 200 characters. If the image is small or blurry, give your most likely reading.",
+                "fieldNames": ["title", "content"],
+                "example": { "title": "Mountain Lake", "content": "A calm alpine lake reflecting snow-capped peaks under a clear sky." }
+            }
+        },
         "holiday": {
             "semanticExtraction": {
                 "promptClause": "First, extract explicit semantic facts visible in the image. Do not infer or invent text that is not visible. If something is not clearly present in the image itself, return null for that field. Assume the current year is {{currentYear}}. If a known holiday is clearly referenced by name or greeting in the image, identify the holidayName. Then, using your internal calendar knowledge for the specified year only, provide the best-known Gregorian date range for that holiday in YYYY-MM-DD format. Prefer widely accepted civil calendar dates. If the holiday is lunar or moon-sighting dependent, provide the most commonly published civil date range for that year (not speculative future estimates). If you are uncertain about the exact dates, still provide your best-known estimate for that year rather than leaving the fields null.",

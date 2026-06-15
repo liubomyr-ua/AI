@@ -100,14 +100,26 @@ AI_LLM.Openai.prototype.executeModel = function (instructions, inputs, options) 
 	};
 	if (instructions) payload.instructions = instructions;
 
-	// Response format
+	// ── Structured output — Responses API ──────────────────────────────────────
+	// NOTE: the Responses API puts structured output under text.format, flattened
+	// (no inner "json_schema" wrapper). The Chat Completions "response_format" key
+	// is deprecated on this endpoint. strict mode requires additionalProperties
+	// false and every property in "required", which AI_LLM.makeStrict() enforces.
 	var rf = options.response_format, js = options.json_schema;
 	if (rf === 'json_schema' && js) {
-		payload.response_format = { type: 'json_schema', json_schema: js };
+		payload.text = {
+			format: {
+				type:   'json_schema',
+				name:   options.schema_name || 'result',
+				strict: true,
+				schema: AI_LLM.makeStrict(js)
+			}
+		};
 	} else if (rf === 'json') {
-		payload.response_format = { type: 'json_object' };
+		payload.text = { format: { type: 'json_object' } };
 	} else if (rf && typeof rf === 'object') {
-		payload.response_format = rf;
+		// Allow callers to pass a fully-formed text.format object.
+		payload.text = { format: rf };
 	}
 
 	// ── Web search tool ───────────────────────────────────────────────────────
@@ -159,6 +171,11 @@ AI_LLM.Openai.prototype.executeModel = function (instructions, inputs, options) 
 /**
  * Extract concatenated text from all output message blocks.
  * Skips web_search_call items — those are tool-execution records, not text.
+ *
+ * Handles structured-output refusals: when strict structured outputs are
+ * enabled and the model declines, the Responses API returns a "refusal"
+ * content block instead of "output_text". We surface that as an error rather
+ * than letting it silently become an empty string.
  * @private
  */
 AI_LLM.Openai.prototype._extractText = function (data) {
@@ -170,6 +187,9 @@ AI_LLM.Openai.prototype._extractText = function (data) {
 		if (item.type !== 'message' || !Array.isArray(item.content)) continue;
 		for (var j = 0; j < item.content.length; j++) {
 			var block = item.content[j];
+			if (block.type === 'refusal' && block.refusal) {
+				throw new Error('AI.LLM.Openai: model refused: ' + block.refusal);
+			}
 			if (block.type === 'output_text' && typeof block.text === 'string') {
 				text += (text ? '\n' : '') + block.text;
 			}

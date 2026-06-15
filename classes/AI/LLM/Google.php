@@ -29,6 +29,14 @@ class AI_LLM_Google extends AI_LLM implements AI_LLM_Interface
 	 * Execute a single Gemini model invocation.
 	 *
 	 * Supports sync + batch (callback) modes.
+	 *
+	 * Structured outputs: when response_format === 'json_schema' and a schema
+	 * is supplied, the adapter sets generationConfig.responseMimeType +
+	 * responseSchema (Gemini's native constrained decoding) in addition to the
+	 * in-prompt schema. The schema is run through AI_LLM::geminiSchema() to
+	 * strip JSON-Schema keywords (additionalProperties) that Gemini's
+	 * OpenAPI-subset responseSchema doesn't accept. Toggle the native path with
+	 * AI/google/structuredOutputs (default true).
 	 */
 	public function executeModel($instructions, array $inputs, array $options = array(), &$raw = null)
 	{
@@ -46,7 +54,7 @@ class AI_LLM_Google extends AI_LLM implements AI_LLM_Interface
 			$model .
 			':generateContent?key=' . urlencode($this->apiKey);
 
-		/* ---------- System / schema enforcement ---------- */
+		/* ---------- System / schema enforcement (prompt-level) ---------- */
 
 		$system = '';
 
@@ -138,6 +146,21 @@ class AI_LLM_Google extends AI_LLM implements AI_LLM_Interface
 				'maxOutputTokens' => $maxTokens
 			)
 		);
+
+		/* ---------- Native structured outputs ---------- */
+
+		$useNative = isset($options['nativeStructured'])
+			? $options['nativeStructured']
+			: Q_Config::get(array('AI', 'google', 'structuredOutputs'), true);
+
+		if ($responseFormat === 'json_schema' && is_array($schema)) {
+			$payload['generationConfig']['responseMimeType'] = 'application/json';
+			if ($useNative) {
+				$payload['generationConfig']['responseSchema'] = AI_LLM::geminiSchema($schema);
+			}
+		} elseif ($responseFormat === 'json') {
+			$payload['generationConfig']['responseMimeType'] = 'application/json';
+		}
 
 		$result = array(
 			'text'  => '',

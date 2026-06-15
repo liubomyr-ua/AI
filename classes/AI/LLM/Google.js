@@ -4,6 +4,13 @@
  * Gemini adapter via Google Generative Language API.
  * Mirrors PHP AI_LLM_Google.
  *
+ * Structured outputs: when response_format === 'json_schema' and a schema is
+ * supplied, sets generationConfig.responseMimeType + responseSchema (native
+ * constrained decoding) in addition to the in-prompt schema. The schema is run
+ * through AI_LLM.geminiSchema() to strip keywords (additionalProperties) that
+ * Gemini's OpenAPI-subset responseSchema doesn't accept. Toggle the native path
+ * with AI/google/structuredOutputs (default true).
+ *
  * @module AI
  */
 var Q      = require('Q');
@@ -55,6 +62,19 @@ AI_LLM.Google.prototype.executeModel = function(instructions, inputs, options) {
 		contents: [{ role: 'user', parts: parts }],
 		generationConfig: { temperature: temperature, maxOutputTokens: maxTokens }
 	};
+
+	// Native structured outputs
+	var useNative = (options.nativeStructured !== undefined)
+		? options.nativeStructured
+		: Q.Config.get(['AI', 'google', 'structuredOutputs'], true);
+	if (rf === 'json_schema' && js) {
+		payload.generationConfig.responseMimeType = 'application/json';
+		if (useNative) {
+			payload.generationConfig.responseSchema = AI_LLM.geminiSchema(js);
+		}
+	} else if (rf === 'json') {
+		payload.generationConfig.responseMimeType = 'application/json';
+	}
 
 	return _post(endpoint, { 'Content-Type': 'application/json' }, payload,
 		(options.timeout || 300) * 1000

@@ -15,6 +15,7 @@
 var Q = require('Q');
 var http = require('http');
 var https = require('https');
+var AI_LLM = require('AI/LLM');
 
 function Local(options) {
 	options = options || {};
@@ -134,11 +135,13 @@ Local.prototype._execute = function (instructions, inputs, options) {
 		body.response_format = { type: 'json_object' };
 	} else if (responseFormat === 'json_schema' && options.json_schema) {
 		if (this.subtype === 'vllm') {
+			// outlines/xgrammar honor the schema's own required/optional as-is.
 			body.guided_json = options.json_schema;
 		} else {
+			// OpenAI-compat strict mode requires additionalProperties:false + required-all.
 			body.response_format = {
 				type: 'json_schema',
-				json_schema: { name: 'response', schema: options.json_schema, strict: true }
+				json_schema: { name: 'response', schema: AI_LLM.makeStrict(options.json_schema), strict: true }
 			};
 		}
 	}

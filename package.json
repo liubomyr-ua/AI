@@ -13,6 +13,9 @@
 		"@tensorflow-models/blazeface": "0.1.0",
 		"@tensorflow/tfjs-node": "^4.14.0"
 	},
+	 "optionalDependencies": {
+		"node-fetch": "^2.7.0"
+	},
 	"repository": {
 		"type": "git",
 		"url": "git://github.com/EGreg/Q.git"

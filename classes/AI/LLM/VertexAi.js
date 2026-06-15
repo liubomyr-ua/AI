@@ -21,6 +21,7 @@ var Q = require('Q');
 var https = require('https');
 var fs = require('fs');
 var crypto = require('crypto');
+var AI_LLM = require('AI/LLM');
 
 function VertexAi(options) {
 	options = options || {};
@@ -45,14 +46,34 @@ VertexAi.prototype.supportsPrefixCache = function () {
 };
 
 VertexAi.prototype.executeModel = function (instructions, inputs, options) {
-	var model = (options && options.model) || this.defaultModel;
+	options = options || {};
+	var model = options.model || this.defaultModel;
 	var publisher = this._detectPublisher(model);
+	// Inject a prompt-level JSON/schema preamble so every publisher path honours
+	// response_format. The Gemini path additionally sets a native responseSchema;
+	// the Anthropic-on-Vertex and OpenAI-compat paths rely on this preamble only.
+	instructions = this._jsonPreamble(options) + (instructions || '');
 	switch (publisher) {
-		case 'anthropic': return this._executeAnthropic(model, instructions, inputs || {}, options || {});
+		case 'anthropic': return this._executeAnthropic(model, instructions, inputs || {}, options);
 		case 'meta':
-		case 'mistralai': return this._executeOpenAICompat(model, instructions, inputs || {}, options || {});
-		default:          return this._executeGemini(model, instructions, inputs || {}, options || {});
+		case 'mistralai': return this._executeOpenAICompat(model, instructions, inputs || {}, options);
+		default:          return this._executeGemini(model, instructions, inputs || {}, options);
 	}
+};
+
+VertexAi.prototype._jsonPreamble = function (options) {
+	var rf = options.response_format, js = options.json_schema;
+	if (rf === 'json_schema' && js) {
+		return 'You are a strict JSON generator.\n'
+			+ 'Output MUST conform exactly to this JSON Schema:\n\n'
+			+ JSON.stringify(js, null, 2)
+			+ '\n\nRules:\n- Output JSON only\n- Do not include prose, comments, or markdown\n'
+			+ '- Do not omit required fields\n- Use null when uncertain\n\n';
+	} else if (rf === 'json') {
+		return 'You are a strict JSON generator.\nOutput MUST be valid JSON.\n'
+			+ 'Do not include prose, comments, or markdown\n\n';
+	}
+	return '';
 };
 
 VertexAi.prototype.executeWithCachedPrefix = function (cacheKey, systemPrefix, inputs, options) {
@@ -111,8 +132,15 @@ VertexAi.prototype._executeGemini = function (model, instructions, inputs, optio
 		body.systemInstruction = { parts: [{ text: instructions }] };
 	}
 	if (options.json_schema) {
+		var useNative = (options.nativeStructured !== undefined)
+			? options.nativeStructured
+			: Q.Config.get(['AI', 'vertex', 'structuredOutputs'], true);
 		body.generationConfig.responseMimeType = 'application/json';
-		body.generationConfig.responseSchema = options.json_schema;
+		if (useNative) {
+			body.generationConfig.responseSchema = AI_LLM.geminiSchema(options.json_schema);
+		}
+	} else if (options.response_format === 'json') {
+		body.generationConfig.responseMimeType = 'application/json';
 	}
 	return this._authedPost(endpoint, body, (options.timeout || 120) * 1000)
 		.then(function (resp) {

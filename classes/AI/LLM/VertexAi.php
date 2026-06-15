@@ -67,6 +67,12 @@ class AI_LLM_VertexAi extends AI_LLM implements AI_LLM_Interface, AI_LLM_Advance
 		$model = isset($options['model']) ? $options['model'] : $this->defaultModel;
 		$publisher = $this->_detectPublisher($model);
 
+		// Inject a prompt-level JSON/schema preamble so every publisher path
+		// honours response_format. The Gemini path additionally sets a native
+		// responseSchema; the Anthropic-on-Vertex and OpenAI-compat paths rely
+		// on this preamble only (no verified native structured-output field).
+		$instructions = $this->_jsonPreamble($options) . (string)$instructions;
+
 		switch ($publisher) {
 			case 'anthropic':
 				return $this->_executeAnthropic($model, $instructions, $inputs, $options, $raw);
@@ -77,6 +83,27 @@ class AI_LLM_VertexAi extends AI_LLM implements AI_LLM_Interface, AI_LLM_Advance
 			default:
 				return $this->_executeGemini($model, $instructions, $inputs, $options, $raw);
 		}
+	}
+
+	/**
+	 * Build a prompt-level JSON/schema instruction from response_format.
+	 * Returns '' when no JSON output was requested.
+	 */
+	protected function _jsonPreamble(array $options)
+	{
+		$rf     = Q::ifset($options, 'response_format', null);
+		$schema = Q::ifset($options, 'json_schema', null);
+		if ($rf === 'json_schema' && is_array($schema)) {
+			return "You are a strict JSON generator.\n"
+				. "Output MUST conform exactly to this JSON Schema:\n\n"
+				. json_encode($schema, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)
+				. "\n\nRules:\n- Output JSON only\n- Do not include prose, comments, or markdown\n"
+				. "- Do not omit required fields\n- Use null when uncertain\n\n";
+		} elseif ($rf === 'json') {
+			return "You are a strict JSON generator.\nOutput MUST be valid JSON.\n"
+				. "Do not include prose, comments, or markdown\n\n";
+		}
+		return '';
 	}
 
 	public function executeWithCachedPrefix($cacheKey, $systemPrefix, array $inputs, array $options = array())
@@ -165,8 +192,15 @@ class AI_LLM_VertexAi extends AI_LLM implements AI_LLM_Interface, AI_LLM_Advance
 			);
 		}
 		if (!empty($options['json_schema'])) {
+			$useNative = isset($options['nativeStructured'])
+				? $options['nativeStructured']
+				: Q_Config::get(array('AI', 'vertex', 'structuredOutputs'), true);
 			$body['generationConfig']['responseMimeType'] = 'application/json';
-			$body['generationConfig']['responseSchema'] = $options['json_schema'];
+			if ($useNative) {
+				$body['generationConfig']['responseSchema'] = AI_LLM::geminiSchema($options['json_schema']);
+			}
+		} elseif (Q::ifset($options, 'response_format', null) === 'json') {
+			$body['generationConfig']['responseMimeType'] = 'application/json';
 		}
 
 		$response = $this->_authedPost($endpoint, $body, Q::ifset($options, 'timeout', 120));

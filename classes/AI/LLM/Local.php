@@ -207,14 +207,19 @@ class AI_LLM_Local extends AI_LLM implements AI_LLM_Interface, AI_LLM_AdvancedIn
 		} elseif ($responseFormat === 'json_schema' && !empty($options['json_schema'])) {
 			// vLLM uses 'guided_json'; OpenAI-compat uses 'response_format.json_schema';
 			// llama-cpp uses 'grammar' (different shape).
+			$strictSchema = AI_LLM::makeStrict($options['json_schema']);
 			if ($this->subtype === 'vllm') {
+				// outlines/xgrammar honor the schema's own required/optional, so
+				// pass it through as-is (no forced required-all).
 				$body['guided_json'] = $options['json_schema'];
 			} else {
+				// OpenAI-compat strict mode requires additionalProperties:false
+				// and every property listed in required — that's what makeStrict does.
 				$body['response_format'] = array(
 					'type' => 'json_schema',
 					'json_schema' => array(
 						'name'   => 'response',
-						'schema' => $options['json_schema'],
+						'schema' => $strictSchema,
 						'strict' => true
 					)
 				);

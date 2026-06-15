@@ -1,5 +1,5 @@
 {
-	"Q": {
+  "Q": {
 		"pluginInfo": {
 			"AI": {
 				"version": "0.1",
@@ -15,16 +15,23 @@
 			}
 		},
 		"handlersBeforeEvent": {
-
+			"Q/responseExtras": ["AI/before/Q_responseExtras"],
+			"Streams/image/save": ["AI/before/Streams_image_save"]
 		},
 		"handlersAfterEvent": {
-			/*"Streams/create/Streams/image": ["AI/after/Streams_create_Streams_image"]*/
+			/* "Streams/create/Streams/image": ["AI/after/Streams_create_Streams_image"] */
+		},
+		"routes@start": {
+			"AI/stream/command": {
+				"module": "AI",
+				"action": "stream/command"
+			}
 		},
 		"routes@end": {
 			
 		},
 		"routes": {
-		    "AI/webhook/:type/:task": {"module": "AI", "action": "webhook"}
+			  "AI/webhook/:type/:task": {"module": "AI", "action": "webhook"}
 		},
 		"web": {
 
@@ -49,8 +56,77 @@
 		"observations": {
 			"AI": "observations.json"
 		},
+		"commands": {
+			"image/generate": {
+				"handler": "AI/commands/imageGenerate",
+				"routing": "background"
+			},
+			"tool/generate": {
+				"handler": "AI/commands/toolGenerate",
+				"routing": "veto"
+			},
+			"stream/create": {
+				"handler": "AI/commands/streamCommand",
+				"routing": "immediate"
+			},
+			"stream/grantAccess": {
+				"handler": "AI/commands/streamCommand",
+				"routing": "immediate"
+			},
+			"stream/revokeAccess": {
+				"handler": "AI/commands/streamCommand",
+				"routing": "immediate"
+			},
+			"slide/generate": {
+				"routing": "veto",
+				"handler": "AI.commands.slideGenerate",
+				"description": "AI-composed HTML slide with images from web search"
+			},
+			"slide/navigate": {
+				"routing": "immediate",
+				"handler": "AI.commands.slideNavigate",
+				"description": "Navigate to a slide by semantic title/content search"
+			}
+		},
 		"images": {
-			"batch": 2
+			"batch": 2,
+			"titles": {
+				"generate": true
+			}
+		},
+		"image": {
+			"provider": "vertex",
+			"vertex": {
+				"projectId": null,
+				"location": "us-central1",
+				"model": "imagegeneration@006",
+				"provisionedThroughput": true
+			}
+		},
+		"schema": "Media/config/messages.schema.json",
+		"voice": {
+			"provider": null,
+			"key": null,
+			"_providers": "elevenlabs | openai | google \u2014 null disables voice synthesis"
+		},
+		"speech": {
+			"provider": null,
+			"_providers": "deepgram | browser | null \u2014 client-side STT adapter. null/browser uses native SpeechRecognition; deepgram routes mic audio through the /Q socket to AI/Transcription/DeepgramStream on the server. Heuristic: if null but AI/deepgram/key is set, treated as 'deepgram'.",
+			"sampleRate": 16000,
+			"chunkMs": 100
+		},
+		"transcription": {
+			"provider": null,
+			"_providers": "deepgram | assemblyai \u2014 null disables server-side transcription (falls back to browser WebSpeech)",
+			"deepgram": {
+				"key": null,
+				"endpointing": 300,
+				"interimResults": true
+			},
+			"assemblyai": {
+				"key": null,
+				"wordBoost": null
+			}
 		}
 	}
 }

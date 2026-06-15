@@ -8,6 +8,13 @@
  * Falls back to web_search_20250305 for older deployments.
  * Activated via options.webSearch = true | { maxUses, version, allowedDomains }.
  *
+ * Structured outputs: when options.response_format === 'json_schema' and a
+ * json_schema is supplied, the adapter sets output_config.format (GA native
+ * structured outputs / constrained decoding) in addition to a prompt-level
+ * JSON instruction. Toggle the native path with AI/anthropic/structuredOutputs
+ * (default true) and, if your account is still on the beta path, set
+ * AI/anthropic/structuredOutputsBeta to the beta header value.
+ *
  * Key difference from OpenAI:
  *   - Tool is declared as { type: "web_search_20260209", name: "web_search", max_uses: N }
  *   - Response content may include server_tool_use + web_search_tool_result blocks
@@ -101,10 +108,20 @@ Anthropic.prototype._execute = function (instructions, inputs, options) {
 		systemBlocks.push({ type: 'text', text: instructions });
 	}
 
-	// JSON format hint appended to system
+	// ── JSON / structured output ───────────────────────────────────────────────
+	// Keep the prompt-level instruction as reinforcement / fallback, AND, when
+	// enabled, set output_config.format below for native constrained decoding.
 	var rf = options.response_format, js = options.json_schema;
+	var nativeFormat = null;
+	var useNativeStructured = (options.nativeStructured !== undefined)
+		? options.nativeStructured
+		: Q.Config.get(['AI', 'anthropic', 'structuredOutputs'], true);
+
 	if (rf === 'json_schema' && js) {
 		systemBlocks.push({ type: 'text', text: 'Respond ONLY with valid JSON conforming to this schema:\n' + JSON.stringify(js, null, 2) + '\nNo prose, no markdown fences.' });
+		if (useNativeStructured) {
+			nativeFormat = { type: 'json_schema', schema: AI_LLM.makeStrict(js) };
+		}
 	} else if (rf === 'json') {
 		systemBlocks.push({ type: 'text', text: 'Respond ONLY with valid JSON. No prose, no markdown fences.' });
 	}
@@ -119,6 +136,9 @@ Anthropic.prototype._execute = function (instructions, inputs, options) {
 		messages:    messages
 	};
 	if (systemBlocks.length) body.system = systemBlocks;
+
+	// Native structured outputs (GA): output_config.format
+	if (nativeFormat) body.output_config = { format: nativeFormat };
 
 	// ── Web search tool ───────────────────────────────────────────────────────
 	var ws = AI_LLM._normalizeWebSearch(options.webSearch);
@@ -144,18 +164,27 @@ Anthropic.prototype._execute = function (instructions, inputs, options) {
 	return new Promise(function (resolve, reject) {
 		var data = JSON.stringify(body);
 		var u    = new URL(self.baseUrl + '/v1/messages');
+
+		var headers = {
+			'Content-Type':      'application/json',
+			'Content-Length':    Buffer.byteLength(data),
+			'x-api-key':         self.apiKey,
+			'anthropic-version': self.apiVersion
+		};
+		// Some accounts/models still require the beta header for structured
+		// outputs rather than the GA output_config path. Opt in via config.
+		if (nativeFormat) {
+			var betaHeader = Q.Config.get(['AI', 'anthropic', 'structuredOutputsBeta'], null);
+			if (betaHeader) headers['anthropic-beta'] = betaHeader;
+		}
+
 		var req  = https.request({
 			method:   'POST',
 			hostname: u.hostname,
 			port:     u.port || 443,
 			path:     u.pathname + (u.search || ''),
-			headers: {
-				'Content-Type':      'application/json',
-				'Content-Length':    Buffer.byteLength(data),
-				'x-api-key':         self.apiKey,
-				'anthropic-version': self.apiVersion
-			},
-			timeout: timeout
+			headers:  headers,
+			timeout:  timeout
 		}, function (res) {
 			var chunks = [];
 			res.on('data', function (c) { chunks.push(c); });
@@ -171,22 +200,15 @@ Anthropic.prototype._execute = function (instructions, inputs, options) {
 					return reject(new Error('AI.LLM.Anthropic error: ' + msg));
 				}
 				var text      = self._extractText(parsed);
-				var citations = options.includeCitations ? self._extractCitations(parsed) : null;
-				var result    = citations ? { text: text, citations: citations } : text;
-				// Expose raw + usage for callers that want it
+				var citations = self._extractCitations(parsed);
 				resolve({
-					text:  text,
-					raw:   parsed,
-					usage: parsed.usage || null,
-					model: parsed.model || model,
-					// Shorthand for callers that just want text:
-					toString: function () { return text; }
+					text:      text,
+					citations: citations,   // [] when web search wasn't used / produced none
+					raw:       parsed,
+					usage:     parsed.usage || null,
+					model:     parsed.model || model,
+					toString:  function () { return text; }
 				});
-				// If includeCitations, resolve with extended object
-				if (citations) {
-					// Already resolved above — this branch won't run.
-					// Structured for clarity; actual resolve is above.
-				}
 			});
 		});
 		req.on('error', reject);
@@ -226,14 +248,27 @@ Anthropic.prototype._extractText = function (response) {
  */
 Anthropic.prototype._extractCitations = function (response) {
 	var citations = [];
+	var seen = {};
 	if (!response || !Array.isArray(response.content)) return citations;
 	response.content.forEach(function (block) {
 		if (!block || block.type !== 'text') return;
 		if (!Array.isArray(block.citations)) return;
 		block.citations.forEach(function (c) {
+			var url = c.url || '';
+			if (!url || seen[url]) return;
+			seen[url] = true;
+			var domain = '', favicon = '';
+			try {
+				var u = new URL(url);
+				domain = u.hostname.replace(/^www\./, '');
+				favicon = u.protocol + '//' + u.hostname + '/favicon.ico';
+			} catch (e) {}
 			citations.push({
-				url:   c.url   || '',
-				title: c.title || ''
+				url:     url,
+				title:   c.title      || '',
+				quote:   (c.cited_text || '').slice(0, 400),
+				domain:  domain,
+				favicon: favicon
 			});
 		});
 	});
@@ -263,7 +298,9 @@ Anthropic.prototype._buildMessages = function (options, inputs) {
 	if (inputs.text)  content.push({ type: 'text', text: inputs.text });
 	if (inputs.images && Array.isArray(inputs.images)) {
 		inputs.images.forEach(function (img) {
-			content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: Buffer.isBuffer(img) ? img.toString('base64') : img } });
+			// Detect the real media type from the bytes rather than hardcoding
+			// png — Anthropic rejects a JPEG labeled as image/png.
+			content.push({ type: 'image', source: { type: 'base64', media_type: _imageMediaType(img), data: Buffer.isBuffer(img) ? img.toString('base64') : img } });
 		});
 	}
 	if (inputs.pdfs && Array.isArray(inputs.pdfs)) {
@@ -274,6 +311,30 @@ Anthropic.prototype._buildMessages = function (options, inputs) {
 	if (!content.length) content.push({ type: 'text', text: '' });
 	return [{ role: 'user', content: content }];
 };
+
+/**
+ * Detect image media type from a Buffer or base64 string.
+ * Anthropic accepts png, jpeg, gif and webp. Falls back to image/jpeg.
+ * @private
+ */
+function _imageMediaType(img) {
+	if (Buffer.isBuffer(img)) {
+		var h = img;
+		if (h.length >= 8 && h[0] === 0x89 && h[1] === 0x50 && h[2] === 0x4E && h[3] === 0x47) return 'image/png';
+		if (h.length >= 3 && h[0] === 0xFF && h[1] === 0xD8 && h[2] === 0xFF) return 'image/jpeg';
+		if (h.length >= 4 && h[0] === 0x47 && h[1] === 0x49 && h[2] === 0x46) return 'image/gif';
+		if (h.length >= 12 && h.slice(0, 4).toString('ascii') === 'RIFF' && h.slice(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+		return 'image/jpeg';
+	}
+	if (typeof img === 'string') {
+		if (img.indexOf('iVBORw0KGgo') === 0) return 'image/png';
+		if (img.indexOf('/9j/') === 0) return 'image/jpeg';
+		if (img.indexOf('R0lGOD') === 0) return 'image/gif';
+		if (img.indexOf('UklGR') === 0) return 'image/webp';
+		return 'image/jpeg';
+	}
+	return 'image/jpeg';
+}
 
 function _notSupported(msg) {
 	var err = new Error('AI.LLM.Anthropic: ' + msg);
