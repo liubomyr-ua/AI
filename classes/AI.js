@@ -55,7 +55,27 @@ AI.listen = function () {
     var Users        = Q.require('Users');
 
     // Get the socket.io server — Users.Socket.listen() is idempotent.
-    var socket = Users.Socket.listen();
+    var pubHost = Q.Config.get(['Streams', 'node', 'host'], Q.Config.get(['Q', 'node', 'host'], null));
+    var pubPort = Q.Config.get(['Streams', 'node', 'port'], Q.Config.get(['Q', 'node', 'port'], null));
+   
+    if (pubHost === null) {
+        throw new Q.Exception("Streams: Missing config field: Streams/node/host");
+    }
+    if (pubPort === null) {
+        throw new Q.Exception("Streams: Missing config field: Streams/node/port");
+    }
+
+    /**
+     * @property socketServer
+     * @type {SocketNamespace}
+     * @private
+     */
+    var socket = Users.Socket.listen({
+        host: pubHost,
+        port: pubPort,
+        https: Q.Config.get(['Q', 'node', 'https'], false) || {},
+    });
+
     var nsp = socket.io.of('/Q');
 
     nsp.on('connection', function (client) {
