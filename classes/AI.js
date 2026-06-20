@@ -207,6 +207,7 @@ AI.listen = function () {
                     publisherId: session.publisherId,
                     streamName:  session.streamName,
                     byUserId:    userId,
+                    byClientId:   session.socketId,
                     type:        'Media/presentation/end',
                     instructions: JSON.stringify({
                         relSec:                 Session.relSec(session),
@@ -263,6 +264,7 @@ AI._afterSessionStart = function (session, data, Users) {
         Session.postMessage(Q, {
             publisherId: session.publisherId, streamName: session.streamName,
             byUserId:    session.userId,
+            byClientId:   session.socketId,
             type:        'Media/presentation/start',
             instructions: JSON.stringify({
                 role: session.role, lang: session.lang, mode: session.mode
@@ -294,6 +296,7 @@ AI._navCommand = function (session, data) {
             publisherId:  session.publisherId,
             streamName:   session.streamName,
             byUserId:     session.userId,
+            byClientId:   session.socketId,
             type:         'Media/presentation/slide',
             instructions: slideInstr,
         }, function (err, message) {
@@ -318,6 +321,7 @@ AI._navCommand = function (session, data) {
         publisherId:  session.publisherId,
         streamName:   session.streamName,
         byUserId:     session.userId,
+        byClientId:   session.socketId,
         type:         'Media/presentation/reveal',
         instructions: revealInstr,
     }, function (err, message) {
@@ -337,6 +341,7 @@ AI._postToolCommit = function (session, toolName) {
         publisherId:  session.publisherId,
         streamName:   session.streamName,
         byUserId:     session.userId,
+        byClientId:   session.socketId,
         type:         'Media/presentation/tool/show',
         instructions: toolInstr,
     }, function (err, message) {

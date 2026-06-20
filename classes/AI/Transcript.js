@@ -86,6 +86,7 @@ Transcript.process = async function (session, chunk, AI, Q, Users) {
             publisherId:  session.publisherId,
             streamName:   session.streamName,
             byUserId:     entry.speaker || session.userId,
+            byClientId:   session.socketId,
             type:         'Media/presentation/transcript',
             content:      entry.text,
             instructions: JSON.stringify({
@@ -112,6 +113,7 @@ Transcript.process = async function (session, chunk, AI, Q, Users) {
             publisherId:  session.publisherId,
             streamName:   session.streamName,
             byUserId:     entry.speaker || session.userId,
+            byClientId:   session.socketId,
             type:         'Streams/chat/message',
             content:      entry.text,
             instructions: JSON.stringify({
@@ -225,6 +227,7 @@ Transcript._onTopicChange = function (session, fromTopic, toTopic, AI, Q, Users)
             publisherId:  session.publisherId,
             streamName:   session.streamName,
             byUserId:     session.userId,
+            byClientId:   session.socketId,
             type:         'Media/presentation/topic',
             instructions: JSON.stringify({ from: fromTopic, to: toTopic, relSec: topicRelSec }),
         });

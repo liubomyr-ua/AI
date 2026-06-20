@@ -122,6 +122,7 @@ StreamProxy._postPresentationRecord = function (session, type, extraInstructions
         publisherId:  session.publisherId,
         streamName:   session.streamName,
         byUserId:     session.userId,
+        byClientId:   session.socketId,
         type:         type,
         instructions: instr,
     }, function (err, message) {
