@@ -195,28 +195,34 @@ AI.listen = function () {
         client.on('disconnect', function () {
             var session = Session.get(client.id);
             if (!session) return;
-            Session.close(session);
-            transcriptEmitter.emitSessionEnd(session);
-            AI.emit('sessionEnd', userId,
-                session.publisherId, session.streamName, {
+
+            // Mark the session disconnected and start the grace timer. All cleanup
+            // (transcript emit, sessionEnd event, durable end-message, removal)
+            // moves into the deferred path so a reconnecting client picks up
+            // where it left off. If grace expires without reconnect, _finalizeEnd
+            // runs the full teardown that used to live here.
+            Session.markDisconnected(session, Q, function _finalizeEnd() {
+                transcriptEmitter.emitSessionEnd(session);
+                AI.emit('sessionEnd', userId,
+                    session.publisherId, session.streamName, {
                     transcriptFile: session.transcriptFile,
-                    chunkCount:     session.transcriptBuffer.length
+                    chunkCount: session.transcriptBuffer.length
                 });
-            if (session.publisherId && session.streamName) {
-                Session.postMessage(Q, {
-                    publisherId: session.publisherId,
-                    streamName:  session.streamName,
-                    byUserId:    userId,
-                    byClientId:   session.socketId,
-                    type:        'Media/presentation/end',
-                    instructions: JSON.stringify({
-                        relSec:                 Session.relSec(session),
-                        transcriptMessageCount: session.transcriptBuffer.length,
-                    }),
-                });
-            }
-            Session.remove(client.id);
-            Q.log && Q.log('AI session ended', userId, client.id);
+                if (session.publisherId && session.streamName) {
+                    Session.postMessage(Q, {
+                        publisherId: session.publisherId,
+                        streamName: session.streamName,
+                        byUserId: userId,
+                        byClientId: session.socketId,
+                        type: 'Media/presentation/end',
+                        instructions: JSON.stringify({
+                            relSec: Session.relSec(session),
+                            transcriptMessageCount: session.transcriptBuffer.length,
+                        }),
+                    });
+                }
+                Q.log && Q.log('AI session ended (grace expired)', userId, session.sessionToken);
+            });
         });
     });
 

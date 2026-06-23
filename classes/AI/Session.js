@@ -20,7 +20,11 @@ function Session() {}
  * @type {Map}
  * @static
  */
-Session.all = new Map();
+Session.all = new Map();          // socketId → session (current binding)
+Session.byToken = new Map();      // sessionToken → session (stable identity)
+Session._pendingCleanup = new Map();  // sessionToken → timeout handle
+
+Session.GRACE_MS = 60 * 1000;     // 60s grace before real cleanup
 
 /**
  * Create a new session for a connected socket. Closes any previous
@@ -35,6 +39,26 @@ Session.all = new Map();
  * @return {Object} the new session object
  */
 Session.create = function (client, userId, data, Q) {
+    var token = (data && data.sessionToken) || Session._generateToken();
+
+    // ── Resume path ──────────────────────────────────────────────
+    var existing = Session.byToken.get(token);
+    if (existing && existing.userId === userId) {
+        // Cancel pending cleanup if any
+        var pending = Session._pendingCleanup.get(token);
+        if (pending) {
+            clearTimeout(pending);
+            Session._pendingCleanup.delete(token);
+        }
+        // Rebind to the new socket
+        Session.all.delete(existing.socketId);
+        existing.socketId = client.id;
+        existing.socket = client;
+        Session.all.set(client.id, existing);
+        Q.log && Q.log('AI Session resumed', { token: token, userId: userId });
+        return existing;
+    }
+
     var lang        = (data && data.lang)        || 'en-US';
     var sampleRate  = (data && data.sampleRate)  || 16000;
     var publisherId = (data && data.publisherId) || null;
@@ -80,10 +104,53 @@ Session.create = function (client, userId, data, Q) {
     if (prev) Session.close(prev);
 
     Session.all.set(client.id, session);
+    Session.byToken.set(token, session);
     session.classifier.locale = lang.split('-')[0];
     session.classifier.reload();
-
     return session;
+};
+
+/**
+ * Mark a session as orphaned (socket disconnected) and schedule the
+ * finalizer to run after the grace period. If the same sessionToken
+ * reconnects in time, cancel the finalizer and rebind the new socket.
+ *
+ * @param {Object}   session
+ * @param {Object}   Q
+ * @param {Function} onFinalize  Called once if the grace period expires
+ *                               without a reconnect. Receives no args.
+ *                               This is where the disconnect handler's
+ *                               "real" cleanup (transcript flush, end
+ *                               message, sessionEnd event) belongs.
+ */
+Session.markDisconnected = function (session, Q, onFinalize) {
+    if (!session) return;
+    Session.all.delete(session.socketId);
+    // Keep session in Session.byToken so a reconnect resume can find it.
+
+    var token = session.sessionToken;
+    // Defensive: if a previous markDisconnected was somehow still pending
+    // for this token (rapid disconnect/reconnect/disconnect), cancel it
+    // before scheduling the new one. Without this, two finalizers race.
+    var existing = Session._pendingCleanup.get(token);
+    if (existing) clearTimeout(existing);
+
+    var timeout = setTimeout(function () {
+        try {
+            if (typeof onFinalize === 'function') onFinalize();
+        } catch (e) {
+            Q && Q.log && Q.log('AI Session finalize error', e && e.message);
+        }
+        Session.close(session);
+        Session.byToken.delete(token);
+        Session._pendingCleanup.delete(token);
+    }, Session.GRACE_MS);
+
+    Session._pendingCleanup.set(token, timeout);
+};
+
+Session._generateToken = function () {
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 };
 
 /**

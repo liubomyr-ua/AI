@@ -56,10 +56,18 @@ Transcript.process = async function (session, chunk, AI, Q, Users) {
     //    available when we write the durable message + VTT cue.
     var isControl = false;
     if (session.role === 'host' && session.modes.navigation !== false) {
+        var clientState = (chunk._state) || {};
         var classifyState = {
-            slideIndex:      session.slideIndex,
-            revealIndex:     session.revealIndex,
-            zoomScale:       session.zoomScale,
+            slideIndex: clientState.slideIndex || 0,
+            slideMode: clientState.slideMode === true,
+            scrollTop: clientState.scrollTop || 0,
+            revealIndex: clientState.revealIndex || 0,
+            zoomScale: clientState.zoomScale || 1,
+            activePreviewType: clientState.activePreviewType,
+
+            //slideIndex:      session.slideIndex,
+            //revealIndex:     session.revealIndex,
+            //zoomScale:       session.zoomScale,
             userId:          session.userId,
             publisherId:     session.publisherId,
             streamName:      session.streamName,
