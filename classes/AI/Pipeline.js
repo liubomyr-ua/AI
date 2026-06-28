@@ -32,7 +32,7 @@
 const Q = require('Q');
 const { buildQueryPrompt, getSchemaCacheKey } = require('./Prompt');
 const AI_LLM                                  = require('./LLM');
-const Session                                 = require('./Session');
+//const Session                                 = require('./Session');
 // ── Intent heuristics ─────────────────────────────────────────────────────────
 
 const _COMPARISON_RE = /\b(vs\.?|versus|compared? to|difference between|better than|worse than)\b/i;

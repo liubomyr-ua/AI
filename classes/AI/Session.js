@@ -3,9 +3,9 @@
 /**
  * @module AI
  */
-
-var ControlClassifier = require('../../../Streams/classes/Streams/ControlClassifier');
 var Q = require('Q');
+var ControlClassifier = require('../../../Streams/classes/Streams/CommandClassifier');
+
 /**
  * Per-socket AI session state and registry.
  *

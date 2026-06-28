@@ -40,7 +40,11 @@
  * AI/classes/AI/Transcription/DeepgramStream.js receives the
  * AI/transcription/session/chunk audio bytes on the /Q socket and
  * forwards to Deepgram's WebSocket API. On transcript, it emits back to
- * the client via Streams/utterance, which lands in _onTranscript below.
+ * the client via AI/transcription/result, which lands in _onTranscript
+ * below. That result surfaces as Q.Speech.Recognition.onResult; Streams
+ * then emits the single upstream Streams/utterance. The relay channel is
+ * deliberately separate from Streams/utterance so the server's caption
+ * echo doesn't feed back into recognition.
  *
  * @module AI
  * @class AI.Speech.Deepgram
@@ -117,7 +121,7 @@
             this._startAudioPipeline();
 
             // 4. Wire transcript + VAD events from socket
-            this._socket.on('Streams/utterance', this._onTranscript.bind(this));
+            this._socket.on('AI/transcription/result', this._onTranscript.bind(this));
             var self = this;
             this._socket.on('AI/vad/start', function () {
                 Q.handle(Q.Speech.Recognition.onSpeechStart, Q.Speech.Recognition);

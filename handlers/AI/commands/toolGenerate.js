@@ -79,13 +79,13 @@ module.exports = async function toolGenerate(captures, stream, state, Q) {
     }
 
     // Route name is configurable per command. Default 'smart'.
-    const routeName = Q.Config.get(['AI', 'commands', 'tool/generate', 'route'], 'smart');
+    const routeName = Q.Config.get(['Streams', 'commands', 'AI', 'tool/generate', 'route'], 'smart');
     const modelOverride = prompts.model || null;
 
     const baseOptions = {
-        max_tokens:  Q.Config.get(['AI', 'commands', 'tool/generate', 'maxTokens'], 4000),
-        temperature: Q.Config.get(['AI', 'commands', 'tool/generate', 'temperature'], 0.5),
-        webSearch:   Q.Config.get(['AI', 'commands', 'tool/generate', 'webSearch'], false)
+        max_tokens:  Q.Config.get(['Streams', 'commands', 'AI', 'tool/generate', 'maxTokens'], 4000),
+        temperature: Q.Config.get(['Streams', 'commands', 'AI', 'tool/generate', 'temperature'], 0.5),
+        webSearch:   Q.Config.get(['Streams', 'commands', 'AI', 'tool/generate', 'webSearch'], false)
     };
     if (modelOverride) baseOptions.model = modelOverride;
 
@@ -121,11 +121,11 @@ module.exports = async function toolGenerate(captures, stream, state, Q) {
     }
 
     // ── 2. Verification pass (optional) ───────────────────────────────────────
-    const verifyEnabled = Q.Config.get(['AI', 'commands', 'tool/generate', 'verify'], true);
+    const verifyEnabled = Q.Config.get(['Streams', 'commands', 'AI',  'tool/generate', 'verify'], true);
     if (verifyEnabled && prompts.verify) {
         try {
             const verifyAdapter = AI_LLM.route(
-                Q.Config.get(['AI', 'commands', 'tool/generate', 'verifyRoute'], 'fast'),
+                Q.Config.get(['Streams', 'commands', 'AI',  'tool/generate', 'verifyRoute'], 'fast'),
                 { response_format: 'json' }
             );
             if (verifyAdapter) {

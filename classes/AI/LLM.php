@@ -430,6 +430,11 @@ abstract class AI_LLM implements AI_LLM_Interface
             return null;
         }
 
+        // 'search' route implies webSearch: true unless caller overrides
+        if ($routeName === 'search' && !isset($options['webSearch'])) {
+            $options['webSearch'] = true;
+        }
+
         // 3. Merge provider config with caller options. Caller options win.
         $mergedOptions = array();
         if (isset($providerDef['config']) && is_array($providerDef['config'])) {
@@ -1121,6 +1126,372 @@ HEREDOC;
 		}
 
 		return $out;
+	}
+	
+	/**
+	 * Lightweight regex-based named entity extraction.
+	 * Runs before any LLM call in the transcript pipeline.
+	 * Returns typed candidate entities for graph lookup and Pexels/search queries.
+	 *
+	 * Does NOT replace LLM-based entity detection — it feeds INTO it, giving the
+	 * LLM pre-structured input rather than raw text, reducing tokens and improving
+	 * consistency. The LLM call disambiguates and scores; this function surfaces
+	 * candidates cheaply.
+	 *
+	 * @method extractEntities
+	 * @static
+	 * @param {string} $text  Transcript segment text
+	 * @return {array}  { persons: [], orgs: [], topics: [], numbers: [], hashtags: [] }
+	 */
+	public static function extractEntities($text)
+	{
+		if (!$text || !is_string($text)) {
+			return array(
+				'persons'  => array(),
+				'orgs'     => array(),
+				'topics'   => array(),
+				'numbers'  => array(),
+				'hashtags' => array()
+			);
+		}
+
+		$persons = array();
+		$orgs = array();
+		$topics = array();
+		$numbers = array();
+		$hashtags = array();
+
+		// Persons: sequences of 2–4 Title Case words
+		// Excludes common false positives (I, A, The, etc.)
+		$stopwords = '/^(The|A|An|In|On|At|For|Of|And|But|Or|So|To|It|Is|Are|Was|Were|Be|Been|Has|Have|Had|That|This|These|Those|With|From|About|Into|Through|During|Before|After|Above|Below|Between|Each|Few|More|Most|Other|Some|Such|No|Nor|Not|Only|Own|Same|Than|Too|Very|Just|Should|Now|My|Your|His|Her|Our|Their|We|They|He|She|What|Which|Who|Whom|How|When|Where|Why)$/i';
+
+		$personPattern = '/\b([A-Z][a-z]{1,20})(?:\s+[A-Z][a-z]{0,20}){1,3}\b/';
+		if (preg_match_all($personPattern, $text, $matches)) {
+			foreach ($matches[0] as $candidate) {
+				$candidate = trim($candidate);
+				$parts = preg_split('/\s+/', $candidate);
+				// Require at least one non-stopword part beyond the first
+				$meaningful = false;
+				for ($i = 1; $i < count($parts); $i++) {
+					if (!preg_match($stopwords, $parts[$i])) {
+						$meaningful = true;
+						break;
+					}
+				}
+				if ($meaningful && !in_array($candidate, $persons)) {
+					$persons[] = $candidate;
+				}
+			}
+		}
+
+		// Orgs: known suffixes or abbreviations
+		$orgPattern = '/\b([A-Z][A-Za-z&]{1,30}(?:\s+[A-Z][A-Za-z&]{1,30}){0,3}(?:\s+(?:Inc|Corp|LLC|Ltd|Co|Group|Foundation|Institute|University|College|School|Labs?|Technologies?|Systems?|Solutions?|Services?|Networks?|Capital|Ventures?|Partners?|Fund|AI|API)\.?))\b/';
+		if (preg_match_all($orgPattern, $text, $matches)) {
+			foreach ($matches[0] as $org) {
+				$org = trim($org);
+				if (!in_array($org, $orgs)) {
+					$orgs[] = $org;
+				}
+			}
+		}
+
+		// All-caps acronyms 2-5 chars (NVIDIA, GPT, LLM, etc.)
+		$acronymPattern = '/\b([A-Z]{2,5})\b/';
+		if (preg_match_all($acronymPattern, $text, $matches)) {
+			foreach ($matches[1] as $acronym) {
+				if (!in_array($acronym, $orgs)) {
+					$orgs[] = $acronym;
+				}
+			}
+		}
+
+		// Numbers with units — stat card candidates
+		$numberPattern = '/\b(\d[\d,]*(?:\.\d+)?)\s*(billion|million|trillion|thousand|percent|%|x|times|dollars?|\$|euros?|bps|ms|kb|mb|gb|tb)?\b/i';
+		if (preg_match_all($numberPattern, $text, $matches)) {
+			for ($i = 0; $i < count($matches[0]); $i++) {
+				$numbers[] = array(
+					'value' => $matches[1][$i],
+					'unit'  => strtolower($matches[2][$i] ?? ''),
+					'raw'   => trim($matches[0][$i])
+				);
+			}
+		}
+
+		// Topics: lowercase keyword phrases after indicator words
+		$topicPattern = '/(?:about|discuss(?:ing)?|talk(?:ing)?\s+about|regard(?:ing)?|on\s+the\s+topic\s+of|focus(?:ing)?\s+on|mention(?:s|ed|ing)?)\s+([a-z][a-z\s]{3,40}?)(?=[,\.;!?\n]|$)/i';
+		if (preg_match_all($topicPattern, $text, $matches)) {
+			foreach ($matches[1] as $topic) {
+				$topic = trim($topic);
+				$wordCount = count(preg_split('/\s+/', $topic));
+				if ($wordCount <= 5 && !in_array($topic, $topics)) {
+					$topics[] = $topic;
+				}
+			}
+		}
+
+		// Hashtags (already structured)
+		$hashtagPattern = '/#([A-Za-z][A-Za-z0-9_]{1,30})/';
+		if (preg_match_all($hashtagPattern, $text, $matches)) {
+			$hashtags = array_merge($hashtags, $matches[1]);
+		}
+
+		return array(
+			'persons'  => $persons,
+			'orgs'     => $orgs,
+			'topics'   => $topics,
+			'numbers'  => $numbers,
+			'hashtags' => $hashtags
+		);
+	}
+
+	/**
+	 * Build Pexels/Pixabay/archive search queries from extracted entities.
+	 * Returns a priority-ordered array of query strings.
+	 * No LLM call — pure string operations.
+	 *
+	 * @method buildSearchQueries
+	 * @static
+	 * @param {array} $entities  Output of extractEntities()
+	 * @param {string} [$contextHint]  Optional context (topic of current episode)
+	 * @return {array}  Query strings, most specific first
+	 */
+	public static function buildSearchQueries(array $entities, $contextHint = null)
+	{
+		$queries = array();
+
+		// Person + context → most specific (profile photo context)
+		if (!empty($entities['persons'])) {
+			foreach ($entities['persons'] as $person) {
+				if ($contextHint) {
+					$queries[] = $person . ' ' . $contextHint;
+				}
+				$queries[] = $person;
+			}
+		}
+
+		// Org + context
+		if (!empty($entities['orgs'])) {
+			foreach ($entities['orgs'] as $org) {
+				if (strlen($org) > 2) { // skip bare acronyms alone
+					if ($contextHint) {
+						$queries[] = $org . ' ' . $contextHint;
+					} else {
+						$queries[] = $org . ' technology';
+					}
+				}
+			}
+		}
+
+		// Numbers with units → chart/stat context
+		if (!empty($entities['numbers'])) {
+			foreach ($entities['numbers'] as $num) {
+				if (!empty($num['unit']) && $contextHint) {
+					$queries[] = $contextHint . ' ' . $num['unit'] . ' statistics';
+				}
+			}
+		}
+
+		// Topics directly
+		if (!empty($entities['topics'])) {
+			foreach ($entities['topics'] as $topic) {
+				$queries[] = $topic;
+			}
+		}
+
+		// Deduplicate and limit
+		$seen = array();
+		$result = array();
+		foreach ($queries as $q) {
+			$q = trim($q);
+			if (!$q || isset($seen[$q])) {
+				continue;
+			}
+			$seen[$q] = true;
+			$result[] = $q;
+			if (count($result) >= 8) {
+				break;
+			}
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Look up avatars matching entity names, using Streams_Avatar::fetchByPrefix()
+	 * directly (in-process database query — no HTTP, no action handler).
+	 *
+	 * The Streams plugin maintains a Streams_Avatar row for every user, indexed by
+	 * firstName, lastName, and username. This method matches entity names against
+	 * those rows by prefix, enabling cheap entity linking before any LLM call.
+	 * Results are de-duplicated by publisherId across all looked-up names.
+	 *
+	 * Mirrors the JS AI_LLM.lookupStreams(), which calls Streams.Avatar.fetchByPrefix().
+	 *
+	 * @method lookupStreams
+	 * @static
+	 * @param {array} $names
+	 *   Person or org names to look up (up to 5 are used per batch). Each name is
+	 *   whitespace-split by fetchByPrefix, e.g. "Tim Cook" → firstName/lastName.
+	 * @param {array} [$options]
+	 * @param {string|Users_User} [$options.toUserId]
+	 *   The viewer the avatars are displayed to. Defaults to the logged-in user id,
+	 *   or '' (public) when nobody is logged in. Passed straight to fetchByPrefix.
+	 * @param {integer} [$options.limit=3]
+	 *   Maximum avatars per name. Total may be higher across names (deduped by publisherId).
+	 * @param {boolean} [$options.public=true]
+	 *   Also match publicly accessible avatars (toUserId=''). Defaults to true here so
+	 *   entity linking still works for not-logged-in / cross-user contexts.
+	 * @param {boolean} [$options.communities=false]
+	 *   Include community publisherIds. Default false (real users only).
+	 * @param {array} [$options.fields]
+	 *   Avatar fields to match against. Defaults to fetchByPrefix's own default
+	 *   (firstName, lastName, username).
+	 * @param {string} [$options.platform]
+	 *   Restrict to users having an xid on this platform.
+	 * @return {array}
+	 *   Associative array { publisherId => Streams_Avatar }, one row per publisherId.
+	 *   Empty array if Streams_Avatar is unavailable or nothing matches.
+	 */
+	public static function lookupStreams(array $names, array $options = array())
+	{
+		if (empty($names)) {
+			return array();
+		}
+
+		// Streams_Avatar must be available in-process.
+		if (!class_exists('Streams_Avatar')
+		|| !method_exists('Streams_Avatar', 'fetchByPrefix')) {
+			return array();
+		}
+
+		// Resolve the viewer. Default to the logged-in user, else public ('').
+		$toUserId = Q::ifset($options, 'toUserId', null);
+		if ($toUserId === null) {
+			$loggedInUser = (class_exists('Users') && method_exists('Users', 'loggedInUser'))
+				? Users::loggedInUser(false)
+				: null;
+			$toUserId = $loggedInUser ? $loggedInUser->id : '';
+		}
+
+		// Per-name fetch options. Default to public:true so entity linking works
+		// outside a single user's address book; callers can override.
+		$fetchOptions = array(
+			'limit'       => Q::ifset($options, 'limit', 3),
+			'public'      => Q::ifset($options, 'public', true),
+			'communities' => Q::ifset($options, 'communities', false)
+		);
+		if (isset($options['fields'])) {
+			$fetchOptions['fields'] = $options['fields'];
+		}
+		if (isset($options['platform'])) {
+			$fetchOptions['platform'] = $options['platform'];
+		}
+
+		$results = array();
+		foreach (array_slice($names, 0, 5) as $name) {
+			$name = trim((string)$name);
+			if ($name === '') {
+				continue;
+			}
+			try {
+				$avatars = Streams_Avatar::fetchByPrefix($toUserId, $name, $fetchOptions);
+			} catch (Exception $e) {
+				// Silently skip a failed name so one bad lookup doesn't break the batch.
+				continue;
+			}
+			if (empty($avatars)) {
+				continue;
+			}
+			// fetchByPrefix already returns { publisherId => Streams_Avatar }.
+			// Merge, keeping the first match per publisherId.
+			foreach ($avatars as $publisherId => $avatar) {
+				if (!isset($results[$publisherId])) {
+					$results[$publisherId] = $avatar;
+				}
+			}
+		}
+
+		return $results;
+	}
+
+	/**
+	 * Declare web search capability.
+	 * Adapters that support built-in web search override this method to return true.
+	 *
+	 * @method supportsWebSearch
+	 * @return {boolean}
+	 */
+	public function supportsWebSearch()
+	{
+		return false;
+	}
+
+	/**
+	 * Normalize options.webSearch into a canonical config object.
+	 * Accepts: true | false | { maxUses, contextSize, allowedDomains, userLocation }
+	 *
+	 * @method _normalizeWebSearch
+	 * @static
+	 * @private
+	 * @param {mixed} $webSearch
+	 * @return {array|null}
+	 */
+	protected static function _normalizeWebSearch($webSearch)
+	{
+		if (!$webSearch) {
+			return null;
+		}
+		if ($webSearch === true) {
+			return array(
+				'maxUses' => 5,
+				'contextSize' => 'medium',
+				'allowedDomains' => null,
+				'userLocation' => null
+			);
+		}
+		if (is_array($webSearch)) {
+			return array(
+				'maxUses' => Q::ifset($webSearch, 'maxUses', 5),
+				'contextSize' => Q::ifset($webSearch, 'contextSize', 'medium'),
+				'allowedDomains' => Q::ifset($webSearch, 'allowedDomains', null),
+				'userLocation' => Q::ifset($webSearch, 'userLocation', null)
+			);
+		}
+		return null;
+	}
+
+	/**
+	 * High-level helper: search the web and return answer text + citations.
+	 * Uses options.webSearch = true implicitly.
+	 * Only works if the adapter supportsWebSearch().
+	 *
+	 * @method searchAndRespond
+	 * @param {string} $instructions  System prompt / framing
+	 * @param {string} $query         What to search for
+	 * @param {array} [$options]
+	 * @param {string|array} [$options.webSearch]  Web search config (default: true)
+	 * @param {boolean} [$options.includeCitations] Return { text, citations[] } instead of string
+	 * @return {string|array}  Text response or {text, citations}
+	 * @throws {Q_Exception}
+	 */
+	public function searchAndRespond($instructions, $query, array $options = array())
+	{
+		if (!$this->supportsWebSearch()) {
+			throw new Q_Exception(array(
+				'message' => 'AI_LLM.searchAndRespond: adapter does not support web search'
+			));
+		}
+
+		$options = array_merge(
+			array('webSearch' => true, 'max_tokens' => 1500),
+			$options
+		);
+
+		return $this->executeModel(
+			$instructions,
+			array('text' => $query),
+			$options
+		);
 	}
 
     protected function _executeWithCallback($prompt, array $inputs, array $options, $parser)

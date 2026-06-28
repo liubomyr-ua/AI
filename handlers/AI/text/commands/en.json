@@ -1,0 +1,25 @@
+{
+	"_comment": "AI command text. 'commands' = display labels (UI); 'phrases' = recognized phrases, keyed by command. AI owns generation; access-control and restyle commands moved to the Streams plugin.",
+	"commands": {
+		"image/generate": "Generate image",
+		"tool/generate": "Build tool"
+	},
+	"phrases": {
+		"image/generate": [
+			"generate an image of {{prompt}}",
+			"create an image of {{prompt}}",
+			"show me {{prompt}}",
+			"visualize {{prompt}}",
+			"draw {{prompt}}",
+			"make a picture of {{prompt}}"
+		],
+		"tool/generate": [
+			"build a {{prompt}}",
+			"create a {{prompt}}",
+			"build me a {{prompt}}",
+			"generate a {{prompt}} widget",
+			"make a {{prompt}} tool",
+			"create a {{prompt}} tool"
+		]
+	}
+}

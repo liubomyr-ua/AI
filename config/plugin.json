@@ -50,43 +50,27 @@
 
 	},
 	"Streams": {
-
+		"commands": {
+			"AI": {
+				"image/generate": {
+					"handler": "AI/commands/imageGenerate",
+					"routing": "background"
+				},
+				"tool/generate": {
+					"handler": "AI/commands/toolGenerate",
+					"routing": "veto"
+				},
+				"slide/generate": {
+					"routing": "veto",
+					"handler": "AI.commands.slideGenerate",
+					"description": "AI-composed HTML slide with images from web search"
+				}
+			}
+		}
 	},
 	"AI": {
 		"observations": {
 			"AI": "observations.json"
-		},
-		"commands": {
-			"image/generate": {
-				"handler": "AI/commands/imageGenerate",
-				"routing": "background"
-			},
-			"tool/generate": {
-				"handler": "AI/commands/toolGenerate",
-				"routing": "veto"
-			},
-			"stream/create": {
-				"handler": "AI/commands/streamCommand",
-				"routing": "immediate"
-			},
-			"stream/grantAccess": {
-				"handler": "AI/commands/streamCommand",
-				"routing": "immediate"
-			},
-			"stream/revokeAccess": {
-				"handler": "AI/commands/streamCommand",
-				"routing": "immediate"
-			},
-			"slide/generate": {
-				"routing": "veto",
-				"handler": "AI.commands.slideGenerate",
-				"description": "AI-composed HTML slide with images from web search"
-			},
-			"slide/navigate": {
-				"routing": "immediate",
-				"handler": "AI.commands.slideNavigate",
-				"description": "Navigate to a slide by semantic title/content search"
-			}
 		},
 		"images": {
 			"batch": 2,
@@ -95,12 +79,29 @@
 			}
 		},
 		"image": {
-			"provider": "vertex",
-			"vertex": {
-				"projectId": null,
-				"location": "us-central1",
-				"model": "imagegeneration@006",
-				"provisionedThroughput": true
+			"default": "openai",
+			"providers": {
+				"openai": {"model": "dall-e-3"},
+				"aws": {"model": "stability.stable-diffusion-xl-v0"},
+				"google": {"background": "transparent"}
+			}
+		},
+		"llm": {
+			"default": "anthropic-direct",
+			"routes": {
+				"smart": "anthropic-direct",
+				"fast": "openai-mini",
+				"search": "anthropic-direct"
+			},
+			"providers": {
+				"anthropic-direct": {
+					"class": "Anthropic",
+					"config": {"model": "claude-3-5-sonnet-20241022"}
+					},
+					"openai-mini": {
+					"class": "Openai",
+					"config": {"model": "gpt-4o-mini"}
+				}
 			}
 		},
 		"schema": "Media/config/messages.schema.json",

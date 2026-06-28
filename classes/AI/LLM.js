@@ -22,7 +22,7 @@
  *
  * NER-first pipeline helpers:
  *   AI_LLM.extractEntities(text) — lightweight regex NER, no LLM cost.
- *   AI_LLM.lookupStreams(entities, options) — Qbix stream title search.
+ *   AI_LLM.lookupStreams(entities, options) — Qbix avatar/stream lookup.
  *   AI_LLM.buildSearchQueries(entities) — structured query list for
  *     Pexels/Pixabay/archive lookups without an LLM call.
  *
@@ -248,30 +248,38 @@ AI_LLM.buildSearchQueries = function (entities, contextHint) {
 	var queries = [];
 
 	// Person + context → most specific (profile photo context)
-	entities.persons.forEach(function (p) {
-		if (contextHint) queries.push(p + ' ' + contextHint);
-		queries.push(p);
-	});
+	if (entities.persons) {
+		entities.persons.forEach(function (p) {
+			if (contextHint) queries.push(p + ' ' + contextHint);
+			queries.push(p);
+		});
+	}
 
-	// Org + AI context
-	entities.orgs.forEach(function (o) {
-		if (o.length > 2) { // skip bare acronyms alone
-			if (contextHint) queries.push(o + ' ' + contextHint);
-			else queries.push(o + ' technology');
-		}
-	});
+	// Org + context
+	if (entities.orgs) {
+		entities.orgs.forEach(function (o) {
+			if (o.length > 2) { // skip bare acronyms alone
+				if (contextHint) queries.push(o + ' ' + contextHint);
+				else queries.push(o + ' technology');
+			}
+		});
+	}
 
 	// Numbers with units → chart/stat context
-	entities.numbers.forEach(function (n) {
-		if (n.unit && contextHint) {
-			queries.push(contextHint + ' ' + n.unit + ' statistics');
-		}
-	});
+	if (entities.numbers) {
+		entities.numbers.forEach(function (n) {
+			if (n.unit && contextHint) {
+				queries.push(contextHint + ' ' + n.unit + ' statistics');
+			}
+		});
+	}
 
 	// Topics directly
-	entities.topics.forEach(function (t) {
-		queries.push(t);
-	});
+	if (entities.topics) {
+		entities.topics.forEach(function (t) {
+			queries.push(t);
+		});
+	}
 
     // Places — direct query, optionally with seasonal/context hint
     entities.places && entities.places.forEach(function (p) {
@@ -294,41 +302,89 @@ AI_LLM.buildSearchQueries = function (entities, contextHint) {
 };
 
 /**
- * Look up stream titles matching entity names.
- * Uses Qbix Streams_Avatar::fetchByPrefix pattern via Q.req.
- * Returns matched streams for profile card proposals without an LLM call.
+ * Look up avatar/stream titles matching entity names.
+ * Uses Streams.Avatar.fetchByPrefix() for fast prefix matching on avatar rows.
+ * Returns matched avatar records for profile card proposals without an LLM call.
  *
- * @param {string[]} names  Person or org names to look up
- * @param {object}   [options]
- * @param {string}   [options.publisherId]  Scope lookup to a publisher
- * @param {number}   [options.limit=3]
- * @returns {Promise<object[]>}  Array of { publisherId, streamName, title, icon }
+ * The Streams module maintains an Avatar row for every user. This method queries
+ * those avatars by firstName, lastName, or username prefix, enabling low-cost
+ * entity linking before LLM calls. Results are de-duplicated by publisherId.
+ *
+ * Mirrors PHP AI_LLM::lookupStreams().
+ *
+ * @method lookupStreams
+ * @static
+ * @param {String[]} names
+ *   Array of person or org names to look up (up to 5 per batch).
+ *   Each name is split on whitespace, e.g. "Tim Cook" → firstName="Tim", lastName="Cook".
+ * @param {Object} [options]
+ * @param {String} [options.asUserId=null]
+ *   The user performing the lookup. Passed to fetchByPrefix for ACL scoping.
+ *   If null, looks up avatars with toUserId='' (public avatars).
+ * @param {Number} [options.limit=3]
+ *   Maximum results per name. Total results may be higher due to deduplication.
+ * @param {Boolean} [options.communities=false]
+ *   Pass true to include community IDs in results. Default: false (users only).
+ * @return {Promise<Object>}
+ *   Resolves to { publisherId: avatarRow, ... } map. One row per unique publisherId.
+ *   If all lookups fail or names is empty, resolves to {}.
+ *
+ * @example
+ *   // Look up avatars for "Tim Cook" and "Sam Altman"
+ *   AI_LLM.lookupStreams(['Tim Cook', 'Sam Altman'], {limit: 3})
+ *     .then(function(avatars) {
+ *       Object.keys(avatars).forEach(function(publisherId) {
+ *         console.log(avatars[publisherId].fields.firstName);
+ *       });
+ *     });
  */
 AI_LLM.lookupStreams = function (names, options) {
-	if (!names || !names.length) return Promise.resolve([]);
+	if (!names || !names.length) return Promise.resolve({});
+	
 	options = options || {};
-	var limit = options.limit || 3;
-	var results = [];
-	var promises = names.slice(0, 5).map(function (name) {
+	var asUserId   = options.asUserId || null;
+	var limit      = options.limit || 3;
+	var communities = options.communities || false;
+
+	// Require Streams module (must be available)
+	var Streams;
+	try {
+		Streams = require('Streams');
+	} catch (e) {
+		return Promise.resolve({});  // Streams not available, return empty
+	}
+
+	if (!Streams.Avatar || !Streams.Avatar.fetchByPrefix) {
+		return Promise.resolve({});  // Avatar model not available
+	}
+
+	var results = {};
+	var names_to_query = names.slice(0, 5);
+	var promises = names_to_query.map(function (name) {
 		return new Promise(function (resolve) {
-			Q.req('Streams/avatar', ['avatars'], function (err, response) {
-				if (err || !response.slots || !response.slots.avatars) return resolve([]);
-				resolve(response.slots.avatars || []);
-			}, {
-				fields: {
-					prefix: name,
-					limit:  limit,
-					communities: false
+			Streams.Avatar.fetchByPrefix(asUserId, name, {
+				limit: limit,
+				communities: communities
+			}, function (err, avatars) {
+				if (err || !avatars) {
+					resolve({});
+					return;
 				}
+				// avatars is a { publisherId: row, ... } map
+				Object.keys(avatars).forEach(function (pid) {
+					if (!results[pid]) {
+						results[pid] = avatars[pid];
+					}
+				});
+				resolve(avatars);
 			});
 		});
 	});
-	return Promise.all(promises).then(function (groups) {
-		groups.forEach(function (group) {
-			(group || []).forEach(function (avatar) {
-				results.push(avatar);
-			});
-		});
+
+	return Promise.all(promises).then(function () {
+		return results;
+	}).catch(function (err) {
+		// Silently fail and return accumulated results so far
 		return results;
 	});
 };

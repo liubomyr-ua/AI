@@ -1,15 +1,88 @@
 <?php
 
+/**
+ * OpenAI Images API adapter for image generation and editing
+ * @class
+ * @implements AI_Image_Interface
+ */
 class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 {
 	const JPEG_QUALITY = 85;
 
 	/**
-	 * Generate an image via OpenAI Images API.
+	 * Generates an image from a text prompt using the OpenAI Images API.
+	 * Supports text-only generation or image-based edits/variations.
 	 *
-	 * @param string $prompt
-	 * @param array  $options
-	 * @return array ['data' => binary, 'format' => string] or ['error' => mixed]
+	 * @method generate
+	 * @param {string} $prompt Description of the image to generate.
+	 * @param {array} [$options=array()] Optional parameters:
+	 *
+	 * @param {string} [$options.model="gpt-image-1.5"] The model to use for generation.
+	 *   Common values: "dall-e-3" (highest quality), "dall-e-2", "gpt-image-1.5" (default).
+	 *
+	 * @param {string} [$options.format="png"] Output image format.
+	 *   Allowed: "png", "jpg", "jpeg", "webp". Defaults to "png".
+	 *
+	 * @param {string} [$options.size="1024x1024"] Desired image dimensions as "WIDTHxHEIGHT".
+	 *   Can also be set via separate $options.width and $options.height (takes precedence over size).
+	 *   Example: "1024x1024", "512x768", "1536x1536".
+	 *
+	 * @param {integer} [$options.width=1024] Image width in pixels (overrides size parameter).
+	 *   Minimum: 64, recommended multiples of 64.
+	 *
+	 * @param {integer} [$options.height=1024] Image height in pixels (overrides size parameter).
+	 *   Minimum: 64, recommended multiples of 64.
+	 *
+	 * @param {string} [$options.quality="auto"] Quality level (for DALL-E 3).
+	 *   Allowed: "standard", "hd" (mapped to "auto"/"high" for API). Default: "auto".
+	 *
+	 * @param {array} [$options.images=array()] One or more existing images to use as reference or base.
+	 *   When provided, triggers image-edit mode (mask-aware editing).
+	 *   Each element should be binary image data or a path to an image file.
+	 *   Supported formats: PNG (with optional alpha), JPEG, GIF, WebP.
+	 *   Internally converted to PNG (if alpha) or JPEG (if opaque) for upload.
+	 *   Example: array(file_get_contents('photo.jpg'), $binaryPngData)
+	 *
+	 * @param {callable} [$options.callback] Optional callback function to handle async responses.
+	 *   Signature: function($result) where $result is ['data' => binary, 'format' => string] or ['error' => mixed].
+	 *   Useful for batch mode or long-running requests.
+	 *
+	 * @param {integer} [$options.timeout=60] Request timeout in seconds. Default: 60.
+	 *
+	 * @return {array} Result array:
+	 *   - Success: ['data' => binary image data, 'format' => string (e.g., 'png')]
+	 *   - Error: ['error' => mixed (error message or decoded JSON response)]
+	 *
+	 * @example
+	 *   // Text-to-image generation
+	 *   $ai = new AI_Image_Openai();
+	 *   $result = $ai->generate('A serene mountain landscape at sunset', [
+	 *       'model' => 'dall-e-3',
+	 *       'size' => '1024x1024',
+	 *       'quality' => 'hd'
+	 *   ]);
+	 *   if (!empty($result['data'])) {
+	 *       file_put_contents('output.png', $result['data']);
+	 *   }
+	 *
+	 * @example
+	 *   // Image-based editing using existing image as reference
+	 *   $baseImage = file_get_contents('original.jpg');
+	 *   $result = $ai->generate('Change the sky to deep purple', [
+	 *       'images' => [$baseImage],
+	 *       'format' => 'png',
+	 *       'model' => 'dall-e-2'
+	 *   ]);
+	 *
+	 * @example
+	 *   // Batch mode with callback
+	 *   $result = $ai->generate('Stylized portrait', [
+	 *       'callback' => function($res) {
+	 *           if (empty($res['error'])) {
+	 *               file_put_contents('async_output.png', $res['data']);
+	 *           }
+	 *       }
+	 *   ]);
 	 */
 	public function generate($prompt, $options = array())
 	{
@@ -29,7 +102,7 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 
 		$userCallback = Q::ifset($options, 'callback', null);
 
-		// --- Size normalization ---
+		// --- Size normalization: prioritize width/height over size parameter ---
 		if (!empty($options['size']) && preg_match('/^(\d+)x(\d+)$/', $options['size'], $m)) {
 			$size = $options['size'];
 		} else {
@@ -48,7 +121,8 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 		);
 
 		/**
-		 * Transport-level callback
+		 * Transport-level callback for handling async and synchronous responses.
+		 * Decodes base64 image data, handles format conversion, and invokes user callback.
 		 */
 		$callback = function ($info, $response) use (&$result, $format, $userCallback) {
 
@@ -83,9 +157,7 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 			}
 		};
 
-		// -------------------------------
-		// TEXT-ONLY GENERATION
-		// -------------------------------
+		// ===== TEXT-ONLY GENERATION =====
 		if (!$useImage) {
 
 			$qualityMap = array(
@@ -117,9 +189,7 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 			);
 		}
 
-		// -------------------------------
-		// IMAGE-BASED GENERATION / EDITS
-		// -------------------------------
+		// ===== IMAGE-BASED EDITING / VARIATIONS =====
 		else {
 			$raw = Q_Utils::toRawBinary(reset($images));
 			if ($raw === false) {
@@ -155,7 +225,7 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 			@unlink($encoded['path']);
 		}
 
-		// Batch mode
+		// Batch mode (callback was invoked asynchronously)
 		if (is_int($response)) {
 			return $result;
 		}
@@ -168,10 +238,47 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 	}
 
 	/**
-	 * Encode input image for OpenAI upload.
-	 * - JPEG if opaque
-	 * - PNG only if alpha exists
-	 * - Never upload WebP
+	 * Removes the background from an image using OpenAI image edits.
+	 * Generates a prompt internally to isolate the subject on a transparent background.
+	 *
+	 * @method removeBackground
+	 * @param {string|binary} $image The image to process. Can be binary data or file path.
+	 * @param {array} [$options=array()] Optional parameters (see generate() for common options).
+	 *   Additional options:
+	 *   - @param {string} [$options.prompt="remove background"] Custom prompt for the edit.
+	 *     Default guides OpenAI to isolate the subject cleanly.
+	 *   - @param {string} [$options.format="png"] Output format (png supports transparency).
+	 *     Recommended: "png" for transparency, "jpg" for opaque background.
+	 *
+	 * @return {array} Result array: ['data' => binary, 'format' => string] or ['error' => mixed].
+	 *
+	 * @example
+	 *   $imageBinary = file_get_contents('portrait.jpg');
+	 *   $result = $ai->removeBackground($imageBinary, ['format' => 'png']);
+	 *   if (empty($result['error'])) {
+	 *       file_put_contents('portrait_transparent.png', $result['data']);
+	 *   }
+	 */
+	public function removeBackground($image, $options = array())
+	{
+		$options['images'] = array($image);
+		$options['prompt'] = Q::ifset($options, 'prompt', 'remove background');
+
+		return $this->generate($options['prompt'], $options);
+	}
+
+	/**
+	 * Encodes an input image for upload to OpenAI API.
+	 * Converts to JPEG for opaque images (smaller), PNG only if transparency needed.
+	 * Rejects WebP (not supported by OpenAI).
+	 *
+	 * @private
+	 * @method encodeForUpload
+	 * @param {string} $binary Raw binary image data.
+	 * @return {array|false} Array with keys 'path' (temp file) and 'mime' (MIME type),
+	 *   or false if image cannot be decoded.
+	 *
+	 * @protected
 	 */
 	protected function encodeForUpload($binary)
 	{
@@ -193,6 +300,16 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 		return array('path' => $tmp, 'mime' => 'image/jpeg');
 	}
 
+	/**
+	 * Checks if a GD image resource has an alpha channel (transparency).
+	 *
+	 * @private
+	 * @method imageHasAlpha
+	 * @param {resource} $img GD image resource.
+	 * @return {boolean} True if image has alpha transparency.
+	 *
+	 * @protected
+	 */
 	protected function imageHasAlpha($img)
 	{
 		if (!imageistruecolor($img)) return false;
@@ -200,7 +317,17 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 	}
 
 	/**
-	 * Convert OpenAI PNG output to requested format
+	 * Converts an OpenAI PNG response to the requested output format.
+	 * For JPG output, composites PNG onto a white background (no transparency).
+	 * For PNG/WebP, returns or converts as-is.
+	 *
+	 * @private
+	 * @method convertFromPng
+	 * @param {string} $pngBinary Binary PNG data from OpenAI API.
+	 * @param {string} $format Target format: "png", "jpg", "jpeg", "webp".
+	 * @return {string|false} Binary image data in requested format, or false on failure.
+	 *
+	 * @protected
 	 */
 	protected function convertFromPng($pngBinary, $format)
 	{
@@ -214,6 +341,7 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 		$w = imagesx($img);
 		$h = imagesy($img);
 
+		// For JPG: composite onto white background to remove alpha
 		$canvas = imagecreatetruecolor($w, $h);
 		$white = imagecolorallocate($canvas, 255, 255, 255);
 		imagefill($canvas, 0, 0, $white);
@@ -242,16 +370,5 @@ class AI_Image_Openai extends AI_Image implements AI_Image_Interface
 		imagedestroy($canvas);
 
 		return $out;
-	}
-
-	/**
-	 * Remove background using OpenAI image edits.
-	 */
-	public function removeBackground($image, $options = array())
-	{
-		$options['images'] = array($image);
-		$options['prompt'] = Q::ifset($options, 'prompt', 'remove background');
-
-		return $this->generate($options['prompt'], $options);
 	}
 }

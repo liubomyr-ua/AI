@@ -5,7 +5,7 @@
  */
 
 var Session = require('./Session');
-var transcriptEmitter = require('../../../Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
+var transcriptEmitter = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
 
 /**
  * Adapter that lets Media's `ControlClassifier` (which expects a `stream`

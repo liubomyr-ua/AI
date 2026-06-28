@@ -3,10 +3,10 @@
 /**
  * @module AI
  */
-
-var Session = require('./Session');
+const Q = require('Q');
+var Session = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript/Session');
 var slideGenerate = require('../../handlers/AI/commands/slideGenerate');
-var transcriptEmitter = require('../../../Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
+var transcriptEmitter = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
 
 /**
  * Visualization-type → card-tool-name map.

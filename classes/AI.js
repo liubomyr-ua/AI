@@ -18,25 +18,24 @@ module.exports = AI;
 Q.makeEventEmitter(AI);
 
 // Lazily loaded after Q is ready to require plugins.
-var Session, Transcript, VetoQueue, CardCommit, AI_Transcription;
+var Transcript, VetoQueue, CardCommit, Session, StreamsTranscript;
 var transcriptEmitter = null;  // hoisted at first AI.listen() — Streams plugin must be loaded first
 
 /**
- * Start node-side listeners for the AI plugin.
+ * Start node-side AI listeners.
  *
- * Opens the `/Q` socket namespace handlers that drive the AI pipeline:
- * transcription session lifecycle, transcript ingestion, control commands,
- * proposal veto, card replay, narration.
+ * Streams now owns the transcription session, the audio adapter, and
+ * Streams/utterance ingestion (see Streams.listen). AI subscribes to that work:
+ * it runs its LLM pipeline on each non-control utterance, and re-broadcasts
+ * session lifecycle on its own event bus. The only client events it still wires
+ * are its own — veto, card replay, narration.
  *
- * Mirrors {{#crossLink "Users/listen:method"}}{{/crossLink}} — all the
- * wiring happens here, and the per-event handlers delegate to focused
- * classes under AI/classes/AI/*.
- *
- * Idempotent — safe to call more than once.
- * Call after Users.Socket.listen() so the /Q namespace exists:
+ * Idempotent. Call after Streams.listen() so the session lifecycle and
+ * 'processed' event exist:
  *
  *   Q.init();
  *   Users.Socket.listen();
+ *   Streams.listen();
  *   Media.listen();
  *   AI.listen();
  *
@@ -46,15 +45,35 @@ var transcriptEmitter = null;  // hoisted at first AI.listen() — Streams plugi
 AI.listen = function () {
     if (AI.listen.result) return AI.listen.result;
 
-    Session          = require('./AI/Session');
-    Transcript       = require('./AI/Transcript');
-    VetoQueue        = require('./AI/VetoQueue');
-    CardCommit       = require('./AI/CardCommit');
-    AI_Transcription = require('./AI/Transcription');
-    transcriptEmitter = require('../../Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
-    var Users        = Q.require('Users');
+    Transcript        = require('./AI/Transcript');
+    VetoQueue         = require('./AI/VetoQueue');
+    CardCommit        = require('./AI/CardCommit');
+    Session           = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript/Session');
+    StreamsTranscript = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript');
+    transcriptEmitter = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
+    var Users         = Q.require('Users');
 
-    // Get the socket.io server — Users.Socket.listen() is idempotent.
+    // ── Subscribe to Streams ingestion (once) ──────────────────────────
+
+    // Every final utterance: run the AI pipeline for non-control narration.
+    StreamsTranscript.on('processed', function (session, result, Q, Users) {
+        Transcript.afterStreams(session, result, AI, Q, Users);
+    });
+
+    // Re-broadcast session lifecycle on the AI event bus for server plugins.
+    transcriptEmitter.on('sessionStart', function (evt) {
+        var s = Session.get(evt.sessionId);
+        AI.emit('sessionStart', s && s.userId, evt.publisherId, evt.streamName,
+            { role: evt.role, lang: evt.lang, ts: evt.ts });
+    });
+    transcriptEmitter.on('sessionEnd', function (evt) {
+        var s = Session.get(evt.sessionId);
+        AI.emit('sessionEnd', s && s.userId, evt.publisherId, evt.streamName,
+            { transcriptFile: evt.transcriptFile, chunkCount: evt.chunkCount });
+    });
+
+    // ── AI-only client events ──────────────────────────────────────────
+
     var pubHost = Q.Config.get(['Streams', 'node', 'host'], Q.Config.get(['Q', 'node', 'host'], null));
     var pubPort = Q.Config.get(['Streams', 'node', 'port'], Q.Config.get(['Q', 'node', 'port'], null));
    
@@ -78,75 +97,70 @@ AI.listen = function () {
 
     var nsp = socket.io.of('/Q');
 
+    // ── Server-side audio transcription (Deepgram / AssemblyAI) ─────────
+    // Only when a provider is configured. The browser ships audio up; the
+    // adapter relays each transcript back down on AI/transcription/result.
+    // The client surfaces that as onResult and Streams emits the single
+    // upstream Streams/utterance, which is the one processing path — so this
+    // relays and never calls process() itself. Inert on browser-native.
+    var sttProvider = (Q.Config && Q.Config.get(['AI', 'transcription', 'provider'], null))
+        || (Q.Config && Q.Config.get(['AI', 'transcription', 'deepgram', 'key'], null) ? 'deepgram' : null);
+
+    if (sttProvider) {
+        var AI_Transcription = require('./AI/Transcription');
+
+        transcriptEmitter.on('sessionStart', function (evt) {
+            var session = Session.get(evt.sessionId);
+            if (!session || session.transcription) return;
+            var adapter = AI_Transcription.create(sttProvider);
+            if (!adapter) return;
+            session.transcription = adapter;
+            adapter.open(session, {
+                Q: Q,
+                onUtterance: function (chunk) {
+                    Users.Socket.emitToUser(session.userId, 'AI/transcription/result', chunk);
+                },
+                onError: function (e) {
+                    Users.Socket.emitToUser(session.userId, 'AI/error', {
+                        message: (adapter.platform || 'Transcription') + ' error: ' + (e && e.message),
+                        code: 502
+                    });
+                }
+            });
+        });
+
+        nsp.on('connection', function (client) {
+            client.on('AI/transcription/session/chunk', function (buffer) {
+                var session = Session.get(client.id);
+                if (session && session.transcription) session.transcription.send(buffer);
+            });
+        });
+    }
+
     nsp.on('connection', function (client) {
         if (client._aiRegistered) return;
         client._aiRegistered = true;
 
         var userId = client.capability && client.capability.userId;
 
-        // ── Session control ─────────────────────────────────────────────
-
-        client.on('AI/session/modes', function (data) {
+        // Veto actions
+        client.on('AI/veto/commit', function (data) {
             var session = Session.get(client.id);
-            if (!session || !data) return;
-            if (data.composition   !== undefined) session.modes.composition   = !!data.composition;
-            if (data.navigation    !== undefined) session.modes.navigation    = !!data.navigation;
-            if (data.transcription !== undefined) session.modes.transcription = !!data.transcription;
-            Q.log && Q.log('AI: modes updated', session.modes);
+            if (session) VetoQueue.commit(session, data && data.proposalId, AI, Q, Users);
         });
-
-        client.on('AI/transcription/session/start', function (data) {
-            if (!userId) return;
-            var session = Session.create(client, userId, data, Q);
-            AI._openTranscription(session, Users);
-            AI._afterSessionStart(session, data, Users);
-        });
-
-        client.on('AI/transcription/session/chunk', function (buffer) {
+        client.on('AI/veto/cancel', function (data) {
             var session = Session.get(client.id);
-            if (session && session.transcription) session.transcription.send(buffer);
+            if (session) VetoQueue.cancel(session, data && data.proposalId, Users);
         });
 
-        client.on('AI/transcription/session/stop',  function () {
-            var session = Session.get(client.id);
-            if (session) Session.close(session);
-        });
-
-        client.on('AI/transcription/session/abort', function () {
-            var session = Session.get(client.id);
-            if (session) Session.close(session);
-        });
-
-        // ── Transcript / pipeline entry point ──────────────────────────
-
-        // Single handler for all utterance sources — WebSpeech, Deepgram echo,
-        // typed text. Shape: { transcript, isFinal, confidence, speaker }.
-        // Interim chunks (isFinal:false) are silently dropped by
-        // Transcript.process — only finals run through the pipeline.
-        client.on('Streams/utterance', function (data) {
-            var session = Session.get(client.id);
-            if (!session) return;
-            Transcript.process(session, data, AI, Q, Users);
-        });
-
-        // ── Navigation commands ────────────────────────────────────────
-
-        client.on('Media/presentation/command', function (data) {
-            var session = Session.get(client.id);
-            if (!session || !data || !data.intent) return;
-            AI._navCommand(session, data);
-        });
-
-        // ── Card replay (host clicks historical card in chat) ──────────
-
+        // Card replay (host clicks a historical card in chat)
         client.on('AI/card/replay', function (data) {
             var session = Session.get(client.id);
-            if (!session) return;
-            CardCommit.replay(session, data, Users);
+            if (session) CardCommit.replay(session, data, Users);
         });
 
-        // ── Narration mode (script playback) ───────────────────────────
-
+        // Narration mode (script playback) — feeds lines as utterances into the
+        // Streams pass, which fires 'processed' and runs the pipeline.
         // data: { lines: [...], msPerLine: 3000 }   host only
         client.on('AI/stream/narrate', function (data) {
             var session = Session.get(client.id);
@@ -160,38 +174,13 @@ AI.listen = function () {
                 if (i >= lines.length) return;
                 var line = lines[i++].trim();
                 if (line) {
-                    Transcript.process(session, {
+                    StreamsTranscript.process(session, {
                         transcript: line, isFinal: true, confidence: 1, speaker: userId
-                    }, AI, Q, Users);
+                    }, Q, Users);
                 }
                 setTimeout(feedNext, msPerLine);
             })();
         });
-
-        // ── Veto actions ───────────────────────────────────────────────
-
-        client.on('AI/veto/commit', function (data) {
-            var session = Session.get(client.id);
-            if (session) VetoQueue.commit(session, data && data.proposalId, AI, Q, Users);
-        });
-
-        client.on('AI/veto/cancel', function (data) {
-            var session = Session.get(client.id);
-            if (session) VetoQueue.cancel(session, data && data.proposalId, Users);
-        });
-
-        // ── Tool committed (generated tool was shown on screen) ────────
-
-        client.on('AI/tool/committed', function (data) {
-            var session = Session.get(client.id);
-            if (!session || !session.publisherId || !session.streamName) return;
-            var toolName = data && data.toolName;
-            if (!toolName) return;
-            AI._postToolCommit(session, toolName);
-        });
-
-        // ── Disconnect ─────────────────────────────────────────────────
-
         client.on('disconnect', function () {
             var session = Session.get(client.id);
             if (!session) return;
@@ -223,6 +212,56 @@ AI.listen = function () {
                 }
                 Q.log && Q.log('AI session ended (grace expired)', userId, session.sessionToken);
             });
+        });
+
+        // ── Veto actions ───────────────────────────────────────────────
+
+        client.on('AI/veto/commit', function (data) {
+            var session = Session.get(client.id);
+            if (session) VetoQueue.commit(session, data && data.proposalId, AI, Q, Users);
+        });
+
+        client.on('AI/veto/cancel', function (data) {
+            var session = Session.get(client.id);
+            if (session) VetoQueue.cancel(session, data && data.proposalId, Users);
+        });
+
+        // ── Tool committed (generated tool was shown on screen) ────────
+
+        client.on('AI/tool/committed', function (data) {
+            var session = Session.get(client.id);
+            if (!session || !session.publisherId || !session.streamName) return;
+            var toolName = data && data.toolName;
+            if (!toolName) return;
+            AI._postToolCommit(session, toolName);
+        });
+
+        // ── Disconnect ─────────────────────────────────────────────────
+
+        client.on('disconnect', function () {
+            var session = Session.get(client.id);
+            if (!session) return;
+            Session.close(session);
+            transcriptEmitter.emitSessionEnd(session);
+            AI.emit('sessionEnd', userId,
+                session.publisherId, session.streamName, {
+                    transcriptFile: session.transcriptFile,
+                    chunkCount:     session.transcriptBuffer.length
+                });
+            if (session.publisherId && session.streamName) {
+                Session.postMessage(Q, {
+                    publisherId: session.publisherId,
+                    streamName:  session.streamName,
+                    byUserId:    userId,
+                    type:        'Media/presentation/end',
+                    instructions: JSON.stringify({
+                        relSec:                 Session.relSec(session),
+                        transcriptMessageCount: session.transcriptBuffer.length,
+                    }),
+                });
+            }
+            Session.remove(client.id);
+            Q.log && Q.log('AI session ended', userId, client.id);
         });
     });
 
@@ -270,7 +309,6 @@ AI._afterSessionStart = function (session, data, Users) {
         Session.postMessage(Q, {
             publisherId: session.publisherId, streamName: session.streamName,
             byUserId:    session.userId,
-            byClientId:   session.socketId,
             type:        'Media/presentation/start',
             instructions: JSON.stringify({
                 role: session.role, lang: session.lang, mode: session.mode
@@ -302,7 +340,6 @@ AI._navCommand = function (session, data) {
             publisherId:  session.publisherId,
             streamName:   session.streamName,
             byUserId:     session.userId,
-            byClientId:   session.socketId,
             type:         'Media/presentation/slide',
             instructions: slideInstr,
         }, function (err, message) {
@@ -327,7 +364,6 @@ AI._navCommand = function (session, data) {
         publisherId:  session.publisherId,
         streamName:   session.streamName,
         byUserId:     session.userId,
-        byClientId:   session.socketId,
         type:         'Media/presentation/reveal',
         instructions: revealInstr,
     }, function (err, message) {
@@ -347,7 +383,6 @@ AI._postToolCommit = function (session, toolName) {
         publisherId:  session.publisherId,
         streamName:   session.streamName,
         byUserId:     session.userId,
-        byClientId:   session.socketId,
         type:         'Media/presentation/tool/show',
         instructions: toolInstr,
     }, function (err, message) {
@@ -375,10 +410,7 @@ AI._postToolCommit = function (session, toolName) {
  *
  * Socket events delivered to clients on the /Q namespace:
  *
- *   Streams/utterance  { transcript, isFinal, confidence, speaker, relSec }
  *   AI/veto/show       { proposal, windowMs }                     host only
- *   AI/veto/commit     { proposalId }
- *   AI/veto/cancel     { proposalId }
  *   AI/coaching        { text, sourceUri }                        host only
  *   AI/proposal/show   { proposalId, visualizationType, visualizationData,
  *                        streamType, citations }

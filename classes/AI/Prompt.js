@@ -1,197 +1,187 @@
-'use strict';
+"use strict";
 /**
  * AI/classes/AI/Prompt.js
  *
  * Builds prompts for the LLM pipeline from messages.schema.json.
  *
- * PRIMARY API — buildQueryPrompt(options)
- * ───────────────────────────────────────
+ * PRIMARY API -- buildQueryPrompt(options)
  * Returns { systemPrefix, instructions, executeOptions }.
  *
- *   systemPrefix   — The full static schema: ALL viz types, image rules, rules.
- *                    ~2900 tokens, byte-stable across calls.
- *                    Goes into the KV cache (Anthropic: cache_control: ephemeral).
- *                    OpenAI caches this automatically (>1024 tokens, no annotation needed).
+ *   systemPrefix   -- The full static schema: ALL viz types, image rules, rules.
+ *                     ~2900 tokens, byte-stable across calls. Goes into the KV
+ *                     cache (Anthropic: cache_control ephemeral). OpenAI caches
+ *                     this automatically (>1024 tokens, no annotation needed).
+ *   instructions   -- Tiny dynamic part: role + publisherId + streamName +
+ *                     contextHint + allow constraint. ~20-60 tokens, NOT cached.
+ *   executeOptions -- { webSearch, max_tokens } for the adapter.
  *
- *   instructions   — Tiny dynamic part: role + publisherId + streamName +
- *                    contextHint + allow constraint sentence.
- *                    ~20-60 tokens, changes every call.
- *                    NOT cached — sent as second uncached system block on Anthropic,
- *                    prepended to the user message on OpenAI.
- *
- *   executeOptions — { webSearch, max_tokens } for the adapter.
- *
- * WHY NOT SLICE THE SCHEMA PER CALL
- * ──────────────────────────────────
- * Slicing (sending only the allowed types) changes the byte content every call,
- * causing a cache miss every time. The cache hit is worth far more than the
- * marginal savings from a shorter prompt. Instead:
- *   - systemPrefix is the FULL unsliced schema (always the same bytes → always a hit)
- *   - instructions constrains the output with one sentence: "Only use: profile, article"
- *
- * CALL PATTERN IN PIPELINE.JS
- * ────────────────────────────
- * If adapter.supportsPrefixCache():
- *   adapter.executeWithCachedPrefix('ai-pipeline-schema-v1', systemPrefix, inputs, {
- *     additionalInstructions: instructions,
- *     ...executeOptions
- *   })
- * Else (OpenAI — auto-caches the prefix internally):
- *   adapter.executeModel(systemPrefix + '\n\n' + instructions, inputs, executeOptions)
+ * Slicing the schema per call would change the bytes every call and miss the
+ * cache; instead systemPrefix is the FULL unsliced schema (stable bytes -> hit)
+ * and the allow-constraint sentence in `instructions` narrows the output.
  *
  * LEGACY API
- * ──────────
- * buildSystemPrompt(options) → string   (backward compat, used by old call sites)
+ *   buildSystemPrompt(options) -> string   (backward compat)
  *
  * @module AI
+ * @class Prompt
+ * @static
  */
 
-const fs   = require('fs');
-const path = require('path');
+var Q    = require('Q');
+var fs   = require('fs');
+var path = require('path');
 
-// ── Schema loading ────────────────────────────────────────────────────────────
+// -- Schema loading ----------------------------------------------------------
 
-let _schema    = null;
-let _schemaMtm = 0;
+var _schema    = null;
+var _schemaMtm = 0;
 
 function _loadSchema() {
     if (_schema) return _schema;
 
-    const candidates = [
-        path.join(__dirname, '../../..', 'Media', 'config', 'messages.schema.json'),
-        process.env.MEDIA_PLUGIN_CONFIG_DIR
-            ? path.join(process.env.MEDIA_PLUGIN_CONFIG_DIR, 'messages.schema.json')
+    var candidates = [
+        Q.pluginDir('AI', 'CONFIG')
+            ? path.join(Q.pluginDir('AI', 'CONFIG'), 'messages.schema.json')
             : null,
-        path.join(__dirname, '../../data', 'messages.schema.json'),
+        path.join(__dirname, '../../..', 'AI', 'config', 'messages.schema.json'),
     ].filter(Boolean);
 
-    for (const c of candidates) {
+    for (var i = 0; i < candidates.length; i++) {
         try {
-            _schema    = JSON.parse(fs.readFileSync(c, 'utf8'));
-            _schemaMtm = fs.statSync(c).mtimeMs;
+            _schema    = JSON.parse(fs.readFileSync(candidates[i], 'utf8'));
+            _schemaMtm = fs.statSync(candidates[i]).mtimeMs;
             return _schema;
         } catch (e) {}
     }
+    Q.log && Q.log('AI.Prompt: messages.schema.json not found in: ' + candidates.join(', '));
     _schema = {};
     return _schema;
 }
 
-// ── Type categories (exported for callers) ───────────────────────────────────
+// -- Type categories (exported for callers) ----------------------------------
 
-const CATEGORIES = {
+var CATEGORIES = {
     cards:  ['stat', 'glossary', 'quote', 'profile', 'article', 'comparison'],
     charts: ['barChart', 'lineChart', 'graph', 'table'],
     rich:   ['stat', 'glossary', 'quote', 'profile', 'article', 'comparison',
              'barChart', 'lineChart', 'graph', 'table', 'slide'],
-    any:    null,  // null → all types from schema
+    any:    null  // null -> all types from schema
 };
 
 function _resolveAllowed(allow, schema) {
-    const all = Object.keys(schema.visualizationTypes || {}).filter(k => !k.startsWith('_'));
+    var all = Object.keys(schema.visualizationTypes || {}).filter(function (k) {
+        return k.charAt(0) !== '_';
+    });
     if (!allow || allow === 'any') return all;
-    const candidates = (typeof allow === 'string')
+    var candidates = (typeof allow === 'string')
         ? (CATEGORIES[allow] || all)
         : (Array.isArray(allow) ? allow : all);
-    return candidates.filter(t => all.includes(t));
+    return candidates.filter(function (t) { return all.indexOf(t) !== -1; });
 }
 
-// ── Static prefix renderers ───────────────────────────────────────────────────
+// -- Static prefix renderers -------------------------------------------------
 
 /**
- * Render ALL visualization types from the schema.
- * This is always the full set — never sliced — so the bytes are stable.
+ * Render ALL visualization types from the schema -- always the full set, never
+ * sliced, so the bytes are stable for the KV cache.
  */
 function _renderAllVizTypes(schema) {
-    const types = schema.visualizationTypes || {};
-    const lines = [];
-    for (const [name, def] of Object.entries(types)) {
-        if (name.startsWith('_')) continue;
-        lines.push(`\n### ${name}`);
+    var types = schema.visualizationTypes || {};
+    var lines = [];
+    Object.keys(types).forEach(function (name) {
+        if (name.charAt(0) === '_') return;
+        var def = types[name];
+        lines.push('\n### ' + name);
         if (def.description) lines.push(def.description);
-        const fields = def.fields || {};
-        const flines = [];
-        for (const [fn, spec] of Object.entries(fields)) {
-            const req = spec.required ? '(required)' : '(optional)';
-            flines.push(`  ${fn} ${req}: ${spec.type || 'string'} — ${spec.description || ''}`);
+        var fields = def.fields || {};
+        var flines = [];
+        Object.keys(fields).forEach(function (fn) {
+            var spec = fields[fn];
+            var req = spec.required ? '(required)' : '(optional)';
+            flines.push('  ' + fn + ' ' + req + ': ' + (spec.type || 'string') +
+                ' -- ' + (spec.description || ''));
+        });
+        if (flines.length) {
+            lines.push('Fields:');
+            lines = lines.concat(flines);
         }
-        if (flines.length) { lines.push('Fields:'); lines.push(...flines); }
         if (def.example != null) {
             lines.push('Example:');
             lines.push('  ' + JSON.stringify(def.example, null, 2).split('\n').join('\n  '));
         }
-    }
+    });
     return lines.join('\n');
 }
 
 /**
- * Render ALL control ephemerals — navigation, gallery, style.
- * Always the full set for byte-stability.
+ * Render ALL control ephemerals. Always the full set for byte-stability.
  */
 function _renderAllEphemerals(schema) {
-    const ephemerals = schema.ephemerals || {};
-    const SKIP = new Set(['Media/presentation/show']);
-    const lines = [];
-    for (const [type, def] of Object.entries(ephemerals)) {
-        if (SKIP.has(type)) continue;
-        lines.push(`\n**${type}**`);
+    var ephemerals = schema.ephemerals || {};
+    var SKIP = { 'Media/presentation/show': true };
+    var lines = [];
+    Object.keys(ephemerals).forEach(function (type) {
+        if (SKIP[type]) return;
+        var def = ephemerals[type];
+        lines.push('\n**' + type + '**');
         if (def.description) lines.push(def.description);
         if (def.payload && Object.keys(def.payload).length) {
             lines.push('Payload: ' + JSON.stringify(def.payload));
         } else if (def.payloadVariants) {
-            def.payloadVariants.forEach((v, i) =>
-                lines.push(`Variant ${i+1} (${v.description}): ${JSON.stringify(v.example)}`));
+            def.payloadVariants.forEach(function (v, i) {
+                lines.push('Variant ' + (i + 1) + ' (' + v.description + '): ' +
+                    JSON.stringify(v.example));
+            });
         } else {
             lines.push('Payload: {}');
         }
-    }
+    });
     return lines.join('\n');
 }
 
-// ── Cached prefix (built once, reused every call) ─────────────────────────────
+// -- Cached prefix (built once, reused every call) ---------------------------
 
-let _cachedPrefix    = null;
-let _cachedPrefixMtm = 0;
+var _cachedPrefix    = null;
+var _cachedPrefixMtm = 0;
 
 /**
- * Build (or return cached) the full static system prefix.
- * Byte-stable: same schema → same bytes → KV cache always hits.
- * ~2900 tokens.
+ * Build (or return cached) the full static system prefix. Byte-stable: same
+ * schema -> same bytes -> KV cache always hits. ~2900 tokens.
  */
 function _buildStaticPrefix() {
-    const schema = _loadSchema();
-    // Rebuild if schema was reloaded
+    var schema = _loadSchema();
     if (_cachedPrefix && _cachedPrefixMtm === _schemaMtm) return _cachedPrefix;
 
-    const vizText = _renderAllVizTypes(schema);
-    const ephText = _renderAllEphemerals(schema);
+    var vizText = _renderAllVizTypes(schema);
+    var ephText = _renderAllEphemerals(schema);
 
     _cachedPrefix = [
         'You are an AI assistant for a live presentation.',
         '',
         '## OUTPUT FORMAT',
-        'Respond with ONE JSON object only — no markdown fences, no preamble:',
+        'Respond with ONE JSON object only -- no markdown fences, no preamble:',
         '{',
         '  "action": "propose" | "ephemeral" | "coaching" | "none",',
         '  "confidence": 0.0-1.0,',
         '  "routing": "shared" | "privateOnly",',
         '',
-        '  // action = "propose" — show a visualization on the shared screen',
+        '  // action = "propose" -- show a visualization on the shared screen',
         '  "visualizationType": "<type from list below>",',
         '  "visualizationData": { /* fields for that type */ },',
         '',
-        '  // action = "ephemeral" — fire a control event directly',
+        '  // action = "ephemeral" -- fire a control event directly',
         '  "ephemeralType": "...",',
         '  "ephemeralPayload": {},',
         '',
-        '  // action = "coaching" — private hint to host only',
+        '  // action = "coaching" -- private hint to host only',
         '  "coachingText": "...",',
         '  "sourceUri": "https://...",',
         '',
-        '  // action = "none" — nothing to show',
+        '  // action = "none" -- nothing to show',
         '}',
         '',
-        'confidence < 0.7 → use "none". Prefer "none" over a weak proposal.',
-        'routing "privateOnly" → host sees it, shared screen does not.',
+        'confidence < 0.7 -> use "none". Prefer "none" over a weak proposal.',
+        'routing "privateOnly" -> host sees it, shared screen does not.',
         '',
         '---',
         '',
@@ -220,102 +210,98 @@ function _buildStaticPrefix() {
         '',
         '## RULES',
         '1. Never invent statistics. Only state what the speaker said or web search confirms.',
-        '2. Map proposals require confirmed coordinates — never expose private locations.',
-        '3. Keep visualizationData concise — it becomes stream attributes visible to all participants.',
+        '2. Map proposals require confirmed coordinates -- never expose private locations.',
+        '3. Keep visualizationData concise -- it becomes stream attributes visible to all participants.',
         '4. For slide: write HTML + inline <style> scoped to .Media_presentation_slide_tool.',
         '   Use data-build="N" data-build-effect="rise|dissolve|slideLeft|slideRight|scale".',
         '   Set buildAuto:true and buildStagger:500 for automatic timed sequence.',
-        '5. "Next slide", "scroll down", "pause" etc. → ephemeral, not proposal.',
-        '6. Respond ONLY with the JSON object.',
+        '5. "Next slide", "scroll down", "pause" etc. -> ephemeral, not proposal.',
+        '6. Respond ONLY with the JSON object.'
     ].join('\n').trim();
 
     _cachedPrefixMtm = _schemaMtm;
     return _cachedPrefix;
 }
 
-// ── Per-call dynamic instructions ─────────────────────────────────────────────
+// -- Per-call dynamic instructions -------------------------------------------
 
 /**
- * Build the tiny per-call instructions block.
- * ~20-60 tokens. Changes every call with role/stream/context/constraint.
- * NOT cached.
+ * Build the tiny per-call instructions block. ~20-60 tokens. NOT cached.
  */
 function _buildInstructions(options) {
-    const role        = options.role        || 'host';
-    const publisherId = options.publisherId || '';
-    const streamName  = options.streamName  || '';
-    const contextHint = options.contextHint || null;
-    const schema      = _loadSchema();
+    var role        = options.role        || 'host';
+    var publisherId = options.publisherId || '';
+    var streamName  = options.streamName  || '';
+    var contextHint = options.contextHint || null;
+    var schema      = _loadSchema();
 
-    const lines = [
-        `Role: ${role}. Stream: publisherId="${publisherId}", streamName="${streamName}".`,
+    var lines = [
+        'Role: ' + role + '. Stream: publisherId="' + publisherId +
+            '", streamName="' + streamName + '".'
     ];
 
-    // Allow constraint — one short sentence
     if (options.allow && options.allow !== 'any') {
-        const allowed = _resolveAllowed(options.allow, schema);
+        var allowed = _resolveAllowed(options.allow, schema);
         if (allowed.length) {
-            lines.push(`For this response, only use these visualization types: ${allowed.join(', ')}.`);
+            lines.push('For this response, only use these visualization types: ' +
+                allowed.join(', ') + '.');
         }
     }
 
-    // Context hint — one sentence about what the speaker just said/asked
     if (contextHint) {
-        lines.push(`Context: ${contextHint}`);
+        lines.push('Context: ' + contextHint);
     }
 
     return lines.join('\n');
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// -- Public API --------------------------------------------------------------
 
 /**
  * Build prompt parts + execute options for a single LLM call.
  *
+ * @method buildQueryPrompt
+ * @static
  * @param {Object} options
- *   @param {string}          [options.role='host']
- *   @param {string}          [options.publisherId]
- *   @param {string}          [options.streamName]
- *   @param {string}          [options.contextHint]   One-sentence context
- *   @param {string|string[]} [options.allow='any']   Type constraint
- *   @param {boolean}         [options.webSearch=true]
- *   @param {number}          [options.maxTokens=2048]
- *
- * @return {{
- *   systemPrefix:  string,   // full static schema — goes in KV cache
- *   instructions:  string,   // tiny dynamic part — NOT cached
- *   executeOptions: object   // { webSearch, max_tokens }
- * }}
+ *   @param {String}          [options.role='host']
+ *   @param {String}          [options.publisherId]
+ *   @param {String}          [options.streamName]
+ *   @param {String}          [options.contextHint]   One-sentence context
+ *   @param {String|Array}    [options.allow='any']   Type constraint
+ *   @param {Boolean}         [options.webSearch=true]
+ *   @param {Number}          [options.maxTokens=2048]
+ * @return {Object} { systemPrefix, instructions, executeOptions }
  */
 function buildQueryPrompt(options) {
     options = options || {};
-
     return {
-        systemPrefix:  _buildStaticPrefix(),
-        instructions:  _buildInstructions(options),
+        systemPrefix:   _buildStaticPrefix(),
+        instructions:   _buildInstructions(options),
         executeOptions: {
             webSearch:  options.webSearch !== false,
-            max_tokens: options.maxTokens || 2048,
-        },
+            max_tokens: options.maxTokens || 2048
+        }
     };
 }
 
 /**
- * Legacy alias — returns just a systemPrompt string for backward compat.
- * Combines prefix + minimal instructions into one string.
+ * Legacy alias -- returns just a systemPrompt string for backward compat.
+ * @method buildSystemPrompt
+ * @static
  */
 function buildSystemPrompt(options) {
-    const { systemPrefix, instructions } = buildQueryPrompt(options);
-    return systemPrefix + (instructions ? '\n\n' + instructions : '');
+    var parts = buildQueryPrompt(options);
+    return parts.systemPrefix + (parts.instructions ? '\n\n' + parts.instructions : '');
 }
 
 /**
- * Cache key for the current schema version.
- * Use as the cacheKey argument to adapter.executeWithCachedPrefix().
- * Changes when the schema file is modified on disk.
+ * Cache key for the current schema version. Use as the cacheKey argument to
+ * adapter.executeWithCachedPrefix(). Changes when the schema file is modified.
+ * @method getSchemaCacheKey
+ * @static
  */
 function getSchemaCacheKey() {
-    _loadSchema(); // ensure mtime is populated
+    _loadSchema();
     return 'ai-pipeline-schema-v' + Math.floor(_schemaMtm / 1000);
 }
 
@@ -323,10 +309,10 @@ function getSchema()    { return _loadSchema(); }
 function reloadSchema() { _schema = null; _cachedPrefix = null; return _loadSchema(); }
 
 module.exports = {
-    buildQueryPrompt,
-    buildSystemPrompt,
-    getSchemaCacheKey,
-    getSchema,
-    reloadSchema,
-    CATEGORIES,
+    buildQueryPrompt:  buildQueryPrompt,
+    buildSystemPrompt: buildSystemPrompt,
+    getSchemaCacheKey: getSchemaCacheKey,
+    getSchema:         getSchema,
+    reloadSchema:      reloadSchema,
+    CATEGORIES:        CATEGORIES
 };
