@@ -23,6 +23,29 @@ var transcriptEmitter = require('../../../Streams/classes/Streams/TranscriptEmit
  */
 function Transcript() {}
 
+
+// Set of intents that benefit from rolling-context (recent3) fallback because
+// the user may pause between the trigger verb and the parameter:
+//   "go to the … pricing slide"          → slide/navigate {query: 'pricing'}
+//   "rewind … thirty seconds"            → video/seek/relative {time}
+//   "highlight … the third bar"          → highlight {elementId}
+//   "generate an image of … a cat"       → image/generate {prompt}
+// Simple intents without captures (slide/next, video/pause, zoom/in, etc.)
+// are self-contained single utterances — pass 2 should not match them, or
+// stale buffer entries trigger false positives ("next slide" lingering in
+// the buffer matching a new "previous slide" utterance).
+var CAPTURE_INTENTS = new Set([
+    'slide/navigate',
+    'video/seek',
+    'video/seek/relative',
+    'highlight',
+    'image/generate',
+    'tool/generate',
+    'stream/create',
+    'stream/grantAccess',
+    'stream/revokeAccess'
+]);
+
 /**
  * Process one final transcript chunk.
  * @method process
@@ -49,25 +72,22 @@ Transcript.process = async function (session, chunk, AI, Q, Users) {
 
     Transcript._resolveDisplayName(session, entry.speaker, Q);
 
-    // Rolling context — catches split control commands ("go to the … roadmap slide")
-    var recent3 = session.transcriptBuffer.slice(-3).map(function (e) { return e.text; }).join(' ');
-
     // 1) Classifier — instant, zero cost. Runs first so the flag is
     //    available when we write the durable message + VTT cue.
     var isControl = false;
     if (session.role === 'host' && session.modes.navigation !== false) {
-        var clientState = (chunk._state) || {};
+        var clientState = chunk._state || {};
         var classifyState = {
-            slideIndex: clientState.slideIndex || 0,
-            slideMode: clientState.slideMode === true,
-            scrollTop: clientState.scrollTop || 0,
-            revealIndex: clientState.revealIndex || 0,
-            zoomScale: clientState.zoomScale || 1,
-            activePreviewType: clientState.activePreviewType,
+            // Authoritative state comes from the client's last snapshot —
+            // server doesn't mirror presentation state any more. See
+            // _emitWithState in control.js for what populates this.
+            slideIndex:        clientState.slideIndex || 0,
+            slideMode:         clientState.slideMode === true,
+            scrollTop:         clientState.scrollTop || 0,
+            revealIndex:       clientState.revealIndex || 0,
+            zoomScale:         clientState.zoomScale || 1,
+            activePreview: clientState.activePreview,
 
-            //slideIndex:      session.slideIndex,
-            //revealIndex:     session.revealIndex,
-            //zoomScale:       session.zoomScale,
             userId:          session.userId,
             publisherId:     session.publisherId,
             streamName:      session.streamName,
@@ -83,8 +103,28 @@ Transcript.process = async function (session, chunk, AI, Q, Users) {
             Users:           Users,
         };
         var proxy = session.publisherId ? StreamProxy.make(session, Q, Users) : null;
-        if (proxy && session.classifier.classify(recent3, proxy, classifyState)) {
-            isControl = true;
+        if (proxy) {
+            // Pass 1: match against the current chunk alone. This is the
+            // common case — a clean single-utterance command like
+            // "next slide" or "zoom in". No buffer contamination possible.
+            if (session.classifier.classify(text, proxy, classifyState)) {
+                isControl = true;
+            } else if (session.transcriptBuffer.length > 1) {
+                // Pass 2: rolling-context fallback for multi-chunk commands
+                // where the parameter arrives in a later isFinal=true chunk
+                // than the trigger verb. Restricted to capture-needing
+                // intents so simple commands can't match stale buffer
+                // entries (the "previous slide" → matched lingering
+                // "next slide" bug).
+                var recent3 = session.transcriptBuffer
+                    .slice(-3)
+                    .map(function (e) { return e.text; })
+                    .join(' ');
+                if (recent3 !== text &&
+                    session.classifier.classify(recent3, proxy, classifyState, CAPTURE_INTENTS)) {
+                    isControl = true;
+                }
+            }
         }
     }
 
@@ -160,13 +200,7 @@ Transcript._processChunk = async function (session, text, AI, Q, Users) {
     if (!session.pipeline) {
         session.pipeline = new Pipeline({
             Q: Q,
-            session: {
-                role:        session.role,
-                publisherId: session.publisherId,
-                streamName:  session.streamName,
-                userId:      session.userId,
-                socket:      session.socket
-            },
+            session: session,
             emitToUser: function (userId, event, data) {
                 Users.Socket.emitToUser(userId, event, data);
             },

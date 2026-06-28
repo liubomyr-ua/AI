@@ -5,7 +5,7 @@
  */
 
 var ControlClassifier = require('../../../Streams/classes/Streams/ControlClassifier');
-
+var Q = require('Q');
 /**
  * Per-socket AI session state and registry.
  *
@@ -128,6 +128,8 @@ Session.markDisconnected = function (session, Q, onFinalize) {
     Session.all.delete(session.socketId);
     // Keep session in Session.byToken so a reconnect resume can find it.
 
+    if(session.pipeline) session.pipeline.destroy();
+
     var token = session.sessionToken;
     // Defensive: if a previous markDisconnected was somehow still pending
     // for this token (rapid disconnect/reconnect/disconnect), cancel it
@@ -227,6 +229,114 @@ Session.postMessage = function (Q, fields, callback) {
         Q.log && Q.log('AI: postMessage exception', e.message);
         if (callback) callback(e);
     }
+};
+
+/**
+ * Post an ephemeral to a stream, broadcasting to all participants
+ * via Streams.Stream.notifyParticipants. Use for transient events
+ * (gallery queries, zoom updates, play/pause toggles) where late
+ * joiners don't need to reconstruct from history.
+ *
+ * Caches the fetched Stream object per (publisherId, streamName)
+ * to avoid re-fetching on every call — the pipeline emits gallery
+ * queries multiple times per session and we don't want a DB round
+ * trip each time.
+ *
+ * @method postEphemeral
+ * @static
+ * @param {Object}   Q
+ * @param {Object}   fields
+ *   @param {String} fields.publisherId
+ *   @param {String} fields.streamName
+ *   @param {String} fields.asUserId       userId to fetch under (host typically)
+ *   @param {String} fields.type           ephemeral type, e.g. 'Streams/gallery/query'
+ *   @param {Object} [fields.payload]      additional payload fields
+ * @param {Function} [callback]            (err)
+ */
+Session.postEphemeral = function (fields,  callback) {
+    if (!fields || !fields.publisherId || !fields.streamName || !fields.type) {
+        var err = new Error('Session.postEphemeral: missing required fields');
+        if (callback) callback(err);
+        return;
+    }
+
+    Session._getStream(fields.publisherId, fields.streamName, fields.asUserId,
+        function (err, stream) {
+            if (err) {
+                Q.log && Q.log('Session.postEphemeral: stream fetch error', err.message || err);
+                if (callback) callback(err);
+                return;
+            }
+            try {
+                var payload = Q.extend({}, fields.payload || {}, { type: fields.type });
+                stream.ephemeral(payload.type, payload, false, function (notifyErr) {
+                    if (notifyErr) {
+                        Q.log && Q.log('Session.postEphemeral: notify error', notifyErr.message || notifyErr);
+                    }
+                    if (callback) callback(notifyErr || null);
+                });
+            } catch (e) {
+                Q.log && Q.log('Session.postEphemeral exception', e.message);
+                if (callback) callback(e);
+            }
+        }
+    );
+};
+
+// ── Internal: stream cache ─────────────────────────────────────────────
+// Keyed by 'publisherId/streamName' → Stream instance.
+// Cache survives for the process lifetime. For a long-running node with
+// many distinct presentations, you may want LRU eviction; for the demo
+// scope this Map is fine.
+Session._streamCache = new Map();
+Session._streamPromises = new Map();   // in-flight fetches
+
+Session._getStream = function (publisherId, streamName, asUserId, callback) {
+    var key = publisherId + '/' + streamName;
+
+    var cached = Session._streamCache.get(key);
+    if (cached) return callback(null, cached);
+
+    var pending = Session._streamPromises.get(key);
+    if (pending) {
+        // Another caller is already fetching; piggyback on the same promise
+        pending.then(function (stream) { callback(null, stream); })
+            .catch(function (err) { callback(err); });
+        return;
+    }
+
+    var promise = new Promise(function (resolve, reject) {
+        var Streams = Q.require('Streams');
+        Streams.fetchOne(
+            asUserId || null,
+            publisherId, streamName,
+            function (err, stream) {
+                Session._streamPromises.delete(key);
+                if (err || !stream) {
+                    return reject(err || new Error('Stream not found: ' + key));
+                }
+                Session._streamCache.set(key, stream);
+                resolve(stream);
+            }
+        );
+    });
+    Session._streamPromises.set(key, promise);
+
+    promise.then(function (stream) { callback(null, stream); })
+        .catch(function (err) { callback(err); });
+};
+
+/**
+ * Invalidate the cached Stream for a given (publisherId, streamName).
+ * Call when a stream is deleted or you have reason to believe its
+ * attributes have changed in a way that matters to subsequent
+ * notify operations.
+ *
+ * @method invalidateStreamCache
+ * @static
+ */
+Session.invalidateStreamCache = function (publisherId, streamName) {
+    Session._streamCache.delete(publisherId + '/' + streamName);
 };
 
 module.exports = Session;

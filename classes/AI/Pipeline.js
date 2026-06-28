@@ -29,10 +29,10 @@
  *
  * @module AI
  */
-
+const Q = require('Q');
 const { buildQueryPrompt, getSchemaCacheKey } = require('./Prompt');
 const AI_LLM                                  = require('./LLM');
-
+const Session                                 = require('./Session');
 // ── Intent heuristics ─────────────────────────────────────────────────────────
 
 const _COMPARISON_RE = /\b(vs\.?|versus|compared? to|difference between|better than|worse than)\b/i;
@@ -81,6 +81,10 @@ class Pipeline {
         this._currentTopic  = null;
         this._onTopicChange = options.onTopicChange || null;
         this._emitToUser    = options.emitToUser    || null;
+        this._lastGalleryQuery = null;
+        this._lastGalleryQueryAt = 0;
+        this._minGalleryHoldMs = 15 * 1000;   // 30s minimum between query changes
+
 
         try {
             this._adapter = AI_LLM.route('smart', { webSearch: true });
@@ -93,6 +97,17 @@ class Pipeline {
         // If true → executeWithCachedPrefix.  If false → executeModel (auto-cached by provider).
         this._canCache = !!(this._adapter && this._adapter.supportsPrefixCache &&
                             this._adapter.supportsPrefixCache());
+
+        this._galleryFlushInterval = setInterval(() => {
+            if (!this._pendingGalleryQuery) return;
+            if (Date.now() - this._lastGalleryQueryAt >= this._minGalleryHoldMs) {
+                const next = this._pendingGalleryQuery;
+                this._pendingGalleryQuery = null;
+                this._lastGalleryQuery = next;
+                this._lastGalleryQueryAt = Date.now();
+                this._emitGalleryQuery(next);
+            }
+        }, 5000);
     }
 
     /**
@@ -110,8 +125,10 @@ class Pipeline {
             const ner = AI_LLM.extractEntities(text);
 
             // ── 2. Background gallery — immediate, no LLM
+            /* const queries = AI_LLM.buildSearchQueries(ner, this._currentTopic);
+            if (queries.length) this._emitGalleryQuery(queries[0]); */
             const queries = AI_LLM.buildSearchQueries(ner, this._currentTopic);
-            if (queries.length) this._emitGalleryQuery(queries[0]);
+            if (queries.length) this._maybeEmitGalleryQuery(queries[0]);
 
             // ── 3. Fast lookup — avatar prefix search, no LLM
             if (ner.persons && ner.persons.length) {
@@ -250,17 +267,67 @@ class Pipeline {
         return d.term || d.label || d.title || d.name || d.topic || null;
     }
 
+    /**
+     * Decide whether to emit a new gallery query based on:
+     *   - Has enough time passed since the last query change?
+     *   - Does the new query meaningfully differ from the last?
+     *
+     * Returns true if a new query was emitted, false if suppressed.
+     */
+    _maybeEmitGalleryQuery(query) {
+        const now = Date.now();
+        const sinceLast = now - this._lastGalleryQueryAt;
+
+        // Same query as before → no point re-emitting
+        if (query === this._lastGalleryQuery) return false;
+
+        // First query of the session → emit immediately
+        if (!this._lastGalleryQuery) {
+            this._lastGalleryQuery = query;
+            this._lastGalleryQueryAt = now;
+            this._emitGalleryQuery(query);
+            return true;
+        }
+
+        // Within hold window → suppress, unless the new query is a
+        // clearly stronger signal (different entity type, longer string)
+        if (sinceLast < this._minGalleryHoldMs) {
+            // Optional: track this as a "pending replacement" that fires
+            // when the hold expires, so we don't permanently miss it
+            this._pendingGalleryQuery = query;
+            return false;
+        }
+
+        // Hold expired or strong signal → emit
+        this._lastGalleryQuery = query;
+        this._lastGalleryQueryAt = now;
+        this._pendingGalleryQuery = null;
+        this._emitGalleryQuery(query);
+        return true;
+    }
+
     _emitGalleryQuery(query) {
         if (!query || !this.session.publisherId) return;
-        const payload = { publisherId: this.session.publisherId,
-                          streamName:  this.session.streamName,
-                          type:        'Streams/gallery/query',
-                          payload:     { query } };
-        if (this._emitToUser) {
-            this._emitToUser(this.session.userId, 'AI/ephemeral', payload);
-        } else if (this.session.socket) {
-            this.session.socket.emit('AI/ephemeral', payload);
-        }
+        /* Session.postEphemeral({
+            publisherId: this.session.publisherId,
+            streamName: this.session.streamName,
+            asUserId: this.session.userId,
+            type: 'Streams/gallery/query',
+            payload: { query: query }
+        }); */
+
+        Session.postMessage(Q, {
+            publisherId: this.session.publisherId,
+            streamName: this.session.streamName,
+            byUserId: this.session.userId,
+            byClientId: this.session.socketId,
+            type: 'Streams/gallery/query',
+            instructions: JSON.stringify({ query: query }),
+        });
+    }
+
+    destroy() {
+        if (this._galleryFlushInterval) clearInterval(this._galleryFlushInterval);
     }
 }
 
