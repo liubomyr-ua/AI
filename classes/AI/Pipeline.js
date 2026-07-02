@@ -124,7 +124,7 @@ class Pipeline extends EventEmitter {
             if (self.session.wakeState === 'listening' &&
                 (Date.now() - self.session.wakeStartedAt) > 5000) {
 
-                const latestWakeEntry = [...self.session.wakeEntires].at(-1);
+                const latestWakeEntry = self.session.wakeEntires[self.session.wakeEntires.length - 1];
 
                 if (!latestWakeEntry.isFinal) return;
 
