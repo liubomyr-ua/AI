@@ -111,7 +111,7 @@ AI_LLM.Openai.prototype.executeModel = function (instructions, inputs, options) 
 			format: {
 				type:   'json_schema',
 				name:   options.schema_name || 'result',
-				strict: true,
+				strict: false,
 				schema: AI_LLM.makeStrict(js)
 			}
 		};
