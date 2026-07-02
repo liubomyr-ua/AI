@@ -76,7 +76,11 @@ AI_Image.Google.JPEG_QUALITY = 85;
  *       format: 'png',
  *       feather: 15,
  *       bgColor: '#ffffff'
+<<<<<<< HEAD
  *   }).then(function(res) { /\* ... *\/ });
+=======
+ *   }).then(function(res) { ... });
+>>>>>>> 644a2e484539b8771cc518c96f6859dd01092fa1
  *
  * @example
  *   // Image-guided generation using reference image
@@ -86,7 +90,11 @@ AI_Image.Google.JPEG_QUALITY = 85;
  *       width: 1536,
  *       height: 1024,
  *       background: 'transparent'
+<<<<<<< HEAD
  *   }).then(function(res) { /\* ... *\/ });
+=======
+ *   }).then(function(res) { ... });
+>>>>>>> 644a2e484539b8771cc518c96f6859dd01092fa1
  *
  * @example
  *   // Composite over gradient background
@@ -95,7 +103,11 @@ AI_Image.Google.JPEG_QUALITY = 85;
  *       format: 'png',
  *       width: 1200,
  *       height: 630
+<<<<<<< HEAD
  *   }).then(function(res) { /\* ... *\/ });
+=======
+ *   }).then(function(res) { ... });
+>>>>>>> 644a2e484539b8771cc518c96f6859dd01092fa1
  */
 AI_Image.Google.prototype.generate = function (prompt, options) {
 	options  = options || {};

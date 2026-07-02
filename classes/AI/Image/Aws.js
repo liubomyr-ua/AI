@@ -106,7 +106,11 @@ AI_Image.Aws.prototype._getClient = function () {
  *       model: 'stability.stable-diffusion-xl-v0',
  *       images: [baseImage],
  *       steps: 60
+<<<<<<< HEAD
  *   }).then(function(res) { /\* ... *\/ });
+=======
+ *   }).then(function(res) { ... });
+>>>>>>> 644a2e484539b8771cc518c96f6859dd01092fa1
  */
 AI_Image.Aws.prototype.generate = function (prompt, options) {
 	options   = options || {};
