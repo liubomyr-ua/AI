@@ -4,6 +4,7 @@
  * @module AI
  */
 const Q = require('Q');
+const Users = require('Users');
 var Session = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript/Session');
 var slideGenerate = require('../../handlers/AI/commands/slideGenerate');
 var transcriptEmitter = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
@@ -42,22 +43,22 @@ function CardCommit() {}
  * @method show
  * @static
  */
-CardCommit.show = function (session, proposal, AI, Q, Users) {
+CardCommit.show = function (session, proposal) {
     var vizType = proposal.visualizationType;
 
     // graph / table go through the ephemeral update path (fanned to Q/visualization/* tools)
     if (vizType === 'graph' || vizType === 'table') {
-        CardCommit._ephemeralUpdate(session, proposal, Users);
+        CardCommit._ephemeralUpdate(session, proposal);
         return;
     }
 
-    // Slide proposals run through the AI-composed-HTML pipeline
+    /* // Slide proposals run through the AI-composed-HTML pipeline
     if (vizType === 'slide') {
-        slideGenerate(session, proposal, AI, Q, Users).catch(function (e) {
+        slideGenerate(session, proposal).catch(function (e) {
             Q.log && Q.log('slideGenerate error:', e.message);
         });
         return;
-    }
+    } */
 
     var streamType = TYPE_MAP[vizType] || 'Media/card/glossary';
     Q.log && Q.log('AI: committing proposal', streamType, proposal.proposalId);
@@ -111,7 +112,7 @@ CardCommit.show = function (session, proposal, AI, Q, Users) {
  * @private
  * @static
  */
-CardCommit._ephemeralUpdate = function (session, proposal, Users) {
+CardCommit._ephemeralUpdate = function (session, proposal) {
     var ephType = proposal.visualizationType === 'graph'
         ? 'Media/presentation/graph/update'
         : 'Media/presentation/table/update';
@@ -130,7 +131,7 @@ CardCommit._ephemeralUpdate = function (session, proposal, Users) {
  * @method replay
  * @static
  */
-CardCommit.replay = function (session, data, Users) {
+CardCommit.replay = function (session, data) {
     if (!data || !data.visualizationData) return;
     Users.Socket.emitToUser(session.userId, 'AI/proposal/show', {
         proposalId:        'replay_' + Date.now(),

@@ -11,9 +11,10 @@
 	"//": "@tensorflow/tfjs-node the last supported Win version is 3.18.0, don't use higher versions under Win",
 	"dependencies": {
 		"@tensorflow-models/blazeface": "0.1.0",
-		"@tensorflow/tfjs-node": "^4.14.0"
+		"@tensorflow/tfjs-node": "^4.14.0",
+		"metaphone": "^2.0.1"
 	},
-	 "optionalDependencies": {
+	"optionalDependencies": {
 		"node-fetch": "^2.7.0"
 	},
 	"repository": {

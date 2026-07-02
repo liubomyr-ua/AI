@@ -6,6 +6,7 @@
  * @main AI
  */
 var Q = require('Q');
+var Users = Q.require('Users');
 
 /**
  * Static methods for the AI plugin.
@@ -18,7 +19,7 @@ module.exports = AI;
 Q.makeEventEmitter(AI);
 
 // Lazily loaded after Q is ready to require plugins.
-var Transcript, VetoQueue, CardCommit, Session, StreamsTranscript;
+var Pipeline, Transcript, VetoQueue, CardCommit, Session, StreamsTranscript;
 var transcriptEmitter = null;  // hoisted at first AI.listen() — Streams plugin must be loaded first
 
 /**
@@ -44,20 +45,37 @@ var transcriptEmitter = null;  // hoisted at first AI.listen() — Streams plugi
  */
 AI.listen = function () {
     if (AI.listen.result) return AI.listen.result;
-
+    Pipeline          = require('./AI/Pipeline');
     Transcript        = require('./AI/Transcript');
     VetoQueue         = require('./AI/VetoQueue');
     CardCommit        = require('./AI/CardCommit');
     Session           = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript/Session');
     StreamsTranscript = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript');
     transcriptEmitter = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/TranscriptEmitter').transcriptEmitter;
-    var Users         = Q.require('Users');
 
     // ── Subscribe to Streams ingestion (once) ──────────────────────────
 
     // Every final utterance: run the AI pipeline for non-control narration.
-    StreamsTranscript.on('processed', function (session, result, Q, Users) {
-        Transcript.afterStreams(session, result, AI, Q, Users);
+    StreamsTranscript.on('processed', async function (session, result) {
+        //console.log('LLM: start', result.isControl)
+        //if (!result.isControl) {
+            if (!result.entry) return;
+            var entry = result.entry;
+            if (!session.pipeline) {
+                session.pipeline = new Pipeline({
+                    session: session,
+                });
+
+                session.pipeline.on('result', function (event) {
+                    AI._processLLMResult(session, event.result, entry)
+                })
+                
+            }
+            var result = await session.pipeline.run(entry);
+
+            AI._processLLMResult(session, result, entry)
+        //}
+        //Transcript.afterStreams(session, result, AI, Q, Users);
     });
 
     // Re-broadcast session lifecycle on the AI event bus for server plugins.
@@ -68,6 +86,9 @@ AI.listen = function () {
     });
     transcriptEmitter.on('sessionEnd', function (evt) {
         var s = Session.get(evt.sessionId);
+        if(s && s.pipeline) {
+            s.pipeline.destroy();
+        }
         AI.emit('sessionEnd', s && s.userId, evt.publisherId, evt.streamName,
             { transcriptFile: evt.transcriptFile, chunkCount: evt.chunkCount });
     });
@@ -269,6 +290,55 @@ AI.listen = function () {
 };
 
 // ── Private helpers used by AI.listen ───────────────────────────────────────
+
+AI._processLLMResult = function (session, result, entry) {
+    if (!result) return;
+    //console.log('LLM: result action', result.action);
+    //console.log('LLM: result visualizationType', result.visualizationType);
+    //console.log('LLM: result confidence', result.confidence);
+
+    if (result.action === 'ephemeral') {
+        if (session.publisherId && result.ephemeralType) {
+            Users.Socket.emitToUser(session.userId, 'AI/ephemeral', {
+                publisherId: session.publisherId,
+                streamName: session.streamName,
+                type: result.ephemeralType,
+                payload: result.ephemeralPayload || {}
+            });
+        }
+        return;
+    }
+    if (result.action === 'coaching' || result.routing === 'privateOnly') {
+        //console.log('LLM: coaching || privateOnly');
+        Users.Socket.emitToUser(session.userId, 'AI/coaching', {
+            text: result.coachingText,
+            sourceUri: result.sourceUri
+        });
+        return;
+    }
+    if (result.action === 'propose') {
+        //console.log('LLM: VetoQueue.enqueue');
+        VetoQueue.enqueue(session, result);
+    }
+
+    if (result.wakeRequest) {
+        // 3) Chat-style transcript post — each person posts under their own userId.
+        if (session.modes.transcription !== false && session.publisherId && session.streamName) {
+            Session.postMessage(Q, {
+                publisherId: session.publisherId,
+                streamName: session.streamName,
+                byUserId: entry.speaker || session.userId,
+                type: 'Streams/chat/message',
+                content: result.wakeRequest,
+                instructions: JSON.stringify({
+                    isTranscript: true,
+                    relSec: entry.relSec,
+                    control: false
+                })
+            });
+        }
+    }
+}
 
 AI._openTranscription = function (session, Users) {
     var provider = (Q.Config && Q.Config.get(['AI', 'transcription', 'provider'], null))

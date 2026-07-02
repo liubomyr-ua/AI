@@ -4,6 +4,9 @@
  * @module AI
  */
 
+var Q = require('Q');
+var Users = require('Users');
+var AI = require('AI');
 var CardCommit = require('./CardCommit');
 
 /**
@@ -23,14 +26,14 @@ function VetoQueue() {}
  * @method enqueue
  * @static
  */
-VetoQueue.enqueue = function (session, proposal, AI, Q, Users) {
+VetoQueue.enqueue = function (session, proposal) {
     var proposalId = proposal.proposalId || ('prop_' + Date.now());
     proposal.proposalId = proposalId;
 
     // Narration mode: auto-commit immediately, no veto window
     if (session.mode === 'narration') {
         session.vetoQueue.push(proposal);
-        VetoQueue.commit(session, proposalId, AI, Q, Users);
+        VetoQueue.commit(session, proposalId);
         return;
     }
 
@@ -39,18 +42,18 @@ VetoQueue.enqueue = function (session, proposal, AI, Q, Users) {
     Users.Socket.emitToUser(session.userId, 'AI/veto/show', { proposal: proposal, windowMs: windowMs });
 
     var timer = setTimeout(function () {
-        VetoQueue.commit(session, proposalId, AI, Q, Users);
+        VetoQueue.commit(session, proposalId);
     }, windowMs);
     session.vetoTimers.set(proposalId, timer);
 };
 
 /**
  * Commit a queued proposal — clears its timer, runs the show-on-canvas
- * dispatch via CardCommit, emits AI.emit('commit') and AI/veto/commit.
+ * dispatch via CardCommit, emits AI/veto/commit.
  * @method commit
  * @static
  */
-VetoQueue.commit = function (session, proposalId, AI, Q, Users) {
+VetoQueue.commit = function (session, proposalId) {
     var timer = session.vetoTimers.get(proposalId);
     if (timer) { clearTimeout(timer); session.vetoTimers.delete(proposalId); }
 
@@ -58,7 +61,7 @@ VetoQueue.commit = function (session, proposalId, AI, Q, Users) {
     if (!proposal) return;
     session.vetoQueue = session.vetoQueue.filter(function (p) { return p.proposalId !== proposalId; });
 
-    CardCommit.show(session, proposal, AI, Q, Users);
+    CardCommit.show(session, proposal);
 
     AI.emit('commit',
         session.userId, session.publisherId, session.streamName, proposal);
