@@ -176,7 +176,6 @@ AI_Image.ANIMALS = [
  *       images: [fs.readFileSync('user.jpg')],
  *       format: 'png',
  *       background: 'transparent'
-
  *   }).then(function(res) { ... });
  *
  * @example

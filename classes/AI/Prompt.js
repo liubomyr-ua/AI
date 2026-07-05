@@ -4,23 +4,13 @@
  *
  * Builds prompts for the LLM pipeline from messages.schema.json.
  *
- * PRIMARY API -- buildQueryPrompt(options)
+ * PRIMARY API — buildQueryPrompt(options)
  * Returns { systemPrefix, instructions, executeOptions }.
  *
- *   systemPrefix   -- The full static schema: ALL viz types, image rules, rules.
- *                     ~2900 tokens, byte-stable across calls. Goes into the KV
- *                     cache (Anthropic: cache_control ephemeral). OpenAI caches
- *                     this automatically (>1024 tokens, no annotation needed).
- *   instructions   -- Tiny dynamic part: role + publisherId + streamName +
- *                     contextHint + allow constraint. ~20-60 tokens, NOT cached.
- *   executeOptions -- { webSearch, max_tokens } for the adapter.
- *
- * Slicing the schema per call would change the bytes every call and miss the
- * cache; instead systemPrefix is the FULL unsliced schema (stable bytes -> hit)
- * and the allow-constraint sentence in `instructions` narrows the output.
- *
- * LEGACY API
- *   buildSystemPrompt(options) -> string   (backward compat)
+ *   systemPrefix   — Full static schema, byte-stable across calls (KV cached).
+ *   instructions   — Tiny per-call block (role, streamName, contextHint, allow).
+ *   executeOptions — { webSearch, max_tokens, response_format, json_schema }
+ *                    with response_format set to guarantee JSON output.
  *
  * @module AI
  * @class Prompt
@@ -82,7 +72,7 @@ function _resolveAllowed(allow, schema) {
 // -- Static prefix renderers -------------------------------------------------
 
 /**
- * Render ALL visualization types from the schema -- always the full set, never
+ * Render ALL visualization types from the schema — always the full set, never
  * sliced, so the bytes are stable for the KV cache.
  */
 function _renderAllVizTypes(schema) {
@@ -139,14 +129,106 @@ function _renderAllEphemerals(schema) {
     return lines.join('\n');
 }
 
+// -- JSON schemas for structured output --------------------------------------
+
+/**
+ * Loose schema for use with `response_format: 'json_schema'`.
+ *
+ * Outer structure is enforced (action must be one of four verbs; confidence
+ * is a number; etc.). Inner objects (visualizationData, ephemeralPayload)
+ * are strings that the LLM emits as JSON-encoded content. Downstream parsing
+ * is responsible for JSON.parse'ing those inner strings.
+ *
+ * Why strings for inner objects: OpenAI's strict mode requires enumerating
+ * every property with additionalProperties:false. visualizationData varies
+ * per visualizationType (glossary has term/definition, barChart has items[],
+ * slide has html/buildAuto). Enumerating a superset for every viz type is
+ * impractical and creates maintenance overhead. Using strings preserves
+ * flexibility while getting outer structure guarantees.
+ *
+ * Callers wanting stricter inner schemas can override via options.jsonSchema.
+ *
+ * @private
+ * @return {Object} JSON Schema
+ */
+function _buildResponseSchema() {
+
+    return {
+
+        type: 'object',
+        additionalProperties: false,
+        required: [
+            'action', 'confidence', 'routing',
+            'visualizationType', 'visualizationData',
+            'ephemeralType', 'ephemeralPayload',
+            'coachingText', 'sourceUri'
+        ],
+        properties: {
+
+            action: {
+                type: 'string',
+                enum: ['propose', 'ephemeral', 'coaching', 'none'],
+                description:
+                    'MUST be one of the four verbs. Never a visualization type.'
+            },
+
+            confidence: {
+                type: 'number',
+                description: '0.0 to 1.0. Below 0.7 use "none" instead.'
+            },
+
+            routing: {
+                type: ['string', 'null'],
+                enum: ['shared', 'privateOnly', null]
+            },
+
+            visualizationType: {
+                type: ['string', 'null'],
+                description:
+                    'Only when action="propose". Type name from the schema list.'
+            },
+
+            visualizationData: {
+                type: ['object', 'null'],
+                additionalProperties: true,
+                description:
+                    'Only when action="propose". A JSON OBJECT (not a string) ' +
+                    'containing the fields defined for the chosen visualizationType.'
+            },
+
+            ephemeralType: {
+                type: ['string', 'null'],
+                description:
+                    'Only when action="ephemeral". Type of control ephemeral.'
+            },
+
+            ephemeralPayload: {
+                type: ['object', 'null'],
+                additionalProperties: true,
+                description:
+                    'Only when action="ephemeral". A JSON OBJECT (not a string) ' +
+                    'matching the payload fields for the chosen ephemeralType.'
+            },
+
+            coachingText: {
+                type: ['string', 'null'],
+                description: 'Only when action="coaching". Message shown to host only.'
+            },
+
+            sourceUri: {
+                type: ['string', 'null'],
+                description: 'Optional source URL when relevant.'
+            }
+        }
+    };
+}
 // -- Cached prefix (built once, reused every call) ---------------------------
 
 var _cachedPrefix    = null;
 var _cachedPrefixMtm = 0;
 
 /**
- * Build (or return cached) the full static system prefix. Byte-stable: same
- * schema -> same bytes -> KV cache always hits. ~2900 tokens.
+ * Build (or return cached) the full static system prefix.
  */
 function _buildStaticPrefix() {
     var schema = _loadSchema();
@@ -159,29 +241,65 @@ function _buildStaticPrefix() {
         'You are an AI assistant for a live presentation.',
         '',
         '## OUTPUT FORMAT',
-        'Respond with ONE JSON object only -- no markdown fences, no preamble:',
+        'Respond with ONE JSON object only -- no markdown fences, no preamble.',
+        '',
+        'The "action" field is ALWAYS exactly one of these four verbs:',
+        '  - "propose"   -> suggest a visualization to display on the shared screen',
+        '  - "ephemeral" -> fire a control event directly (no veto)',
+        '  - "coaching"  -> private hint shown only to the host',
+        '  - "none"      -> nothing to show',
+        '',
+        'NEVER put a visualization type (like "glossary", "stat", "comparison") in the',
+        '"action" field. Those go inside "visualizationType". See examples below.',
+        '',
+        'Schema:',
         '{',
         '  "action": "propose" | "ephemeral" | "coaching" | "none",',
         '  "confidence": 0.0-1.0,',
-        '  "routing": "shared" | "privateOnly",',
+        '  "routing": "shared" | "privateOnly" | null,',
         '',
-        '  // action = "propose" -- show a visualization on the shared screen',
-        '  "visualizationType": "<type from list below>",',
-        '  "visualizationData": { /* fields for that type */ },',
+        '  // when action = "propose"',
+        '  "visualizationType": "<type from list below>" | null,',
+        '  "visualizationData": { ...fields for the chosen type... } | null,',
         '',
-        '  // action = "ephemeral" -- fire a control event directly',
-        '  "ephemeralType": "...",',
-        '  "ephemeralPayload": {},',
+        '  // when action = "ephemeral"',
+        '  "ephemeralType": "..." | null,',
+        '  "ephemeralPayload": { ...fields for the chosen type... } | null,',
         '',
-        '  // action = "coaching" -- private hint to host only',
-        '  "coachingText": "...",',
-        '  "sourceUri": "https://...",',
-        '',
-        '  // action = "none" -- nothing to show',
+        '  // when action = "coaching"',
+        '  "coachingText": "..." | null,',
+        '  "sourceUri": "https://..." | null',
         '}',
         '',
+        'Set unused fields to null. All fields must be present.',
         'confidence < 0.7 -> use "none". Prefer "none" over a weak proposal.',
         'routing "privateOnly" -> host sees it, shared screen does not.',
+        '',
+        '---',
+        '',
+        '## CORRECT EXAMPLE',
+        '{',
+        '  "action": "propose",',
+        '  "confidence": 0.95,',
+        '  "routing": "shared",',
+        '  "visualizationType": "glossary",',
+        '  "visualizationData": {"term":"Generative AI","definition":"AI systems that create new content","context":"Used for text, images, music, code generation."},',
+        '  "ephemeralType": null,',
+        '  "ephemeralPayload": null,',
+        '  "coachingText": null,',
+        '  "sourceUri": null',
+        '}',
+        '',
+        '## INCORRECT EXAMPLES -- DO NOT RESPOND LIKE THESE',
+        '',
+        '// Wrong: action is a visualization type',
+        '{ "action": "glossary", "term": "..." }',
+        '',
+        '// Wrong: visualizationData as a JSON-encoded string instead of a raw object',
+        '{ "action": "propose", "visualizationData": "{\"term\":\"...\"}" }',
+        '',
+        '// Wrong: missing null fields',
+        '{ "action": "propose", "visualizationType": "glossary", "visualizationData": {"term":"..."} }',
         '',
         '---',
         '',
@@ -198,8 +316,8 @@ function _buildStaticPrefix() {
         '',
         '## IMAGES FROM WEB SEARCH',
         'When web search returns pages with images (Wikipedia infoboxes, news thumbnails,',
-        'person photos), include the image URL directly in your output:',
-        '- Cards (stat, profile, article, quote): add "imageUrl": "<url>", "imageCredit": "<domain>"',
+        'person photos), include the image URL directly inside visualizationData:',
+        '- Cards (stat, profile, article, quote): add "imageUrl" and "imageCredit"',
         '- Comparison: add "leftImageUrl" and "rightImageUrl"',
         '- Slide: embed images as <img src="<url>" onerror="this.style.display=\'none\'">',
         '- Only include imageUrl when you find a real direct image URL on a searched page.',
@@ -216,7 +334,13 @@ function _buildStaticPrefix() {
         '   Use data-build="N" data-build-effect="rise|dissolve|slideLeft|slideRight|scale".',
         '   Set buildAuto:true and buildStagger:500 for automatic timed sequence.',
         '5. "Next slide", "scroll down", "pause" etc. -> ephemeral, not proposal.',
-        '6. Respond ONLY with the JSON object.'
+        '6. Respond ONLY with the JSON object.',
+        '',
+        '## REMINDER',
+        '"action" is always exactly one of: propose, ephemeral, coaching, none.',
+        '"visualizationData" and "ephemeralPayload" are plain JSON objects, never strings.',
+        'Every field must be present (set unused ones to null).',
+        'Re-read the CORRECT EXAMPLE above before responding.'
     ].join('\n').trim();
 
     _cachedPrefixMtm = _schemaMtm;
@@ -225,9 +349,6 @@ function _buildStaticPrefix() {
 
 // -- Per-call dynamic instructions -------------------------------------------
 
-/**
- * Build the tiny per-call instructions block. ~20-60 tokens. NOT cached.
- */
 function _buildInstructions(options) {
     var role        = options.role        || 'host';
     var publisherId = options.publisherId || '';
@@ -263,29 +384,55 @@ function _buildInstructions(options) {
  * @method buildQueryPrompt
  * @static
  * @param {Object} options
- *   @param {String}          [options.role='host']
- *   @param {String}          [options.publisherId]
- *   @param {String}          [options.streamName]
- *   @param {String}          [options.contextHint]   One-sentence context
- *   @param {String|Array}    [options.allow='any']   Type constraint
- *   @param {Boolean}         [options.webSearch=true]
- *   @param {Number}          [options.maxTokens=2048]
+ *   @param {String}       [options.role='host']
+ *   @param {String}       [options.publisherId]
+ *   @param {String}       [options.streamName]
+ *   @param {String}       [options.contextHint]     One-sentence context
+ *   @param {String|Array} [options.allow='any']     Type constraint
+ *   @param {Boolean}      [options.webSearch=true]
+ *   @param {Number}       [options.maxTokens=2048]
+ *   @param {String}       [options.responseFormat]  Override: 'json' | 'json_schema'
+ *                                                   Default: 'json_schema' with the
+ *                                                   built-in loose schema (outer
+ *                                                   structure enforced, inner data
+ *                                                   as JSON strings).
+ *   @param {Object}       [options.jsonSchema]      Override the built-in schema
+ *                                                   when responseFormat='json_schema'.
  * @return {Object} { systemPrefix, instructions, executeOptions }
  */
 function buildQueryPrompt(options) {
     options = options || {};
+
+    // Default: strict json_schema with the outer-structure schema.
+    // Callers can pass responseFormat: 'json' for lighter enforcement
+    // (guaranteed valid JSON without structural rules), or provide their
+    // own jsonSchema to enforce inner fields.
+    var responseFormat = options.responseFormat || 'json_schema';
+    var jsonSchema     = options.jsonSchema     || _buildResponseSchema();
+
+    var executeOptions = {
+        webSearch:  options.webSearch !== false,
+        max_tokens: options.maxTokens || 2048
+    };
+
+    if (responseFormat === 'json_schema') {
+        executeOptions.response_format = 'json_schema';
+        executeOptions.json_schema     = jsonSchema;
+        executeOptions.schema_name     = options.schemaName || 'ai_pipeline_response';
+    } else if (responseFormat === 'json') {
+        executeOptions.response_format = 'json';
+    }
+    // 'none' or any other value -> no structured output enforcement.
+
     return {
         systemPrefix:   _buildStaticPrefix(),
         instructions:   _buildInstructions(options),
-        executeOptions: {
-            webSearch:  options.webSearch !== false,
-            max_tokens: options.maxTokens || 2048
-        }
+        executeOptions: executeOptions
     };
 }
 
 /**
- * Legacy alias -- returns just a systemPrompt string for backward compat.
+ * Legacy alias — returns just a systemPrompt string for backward compat.
  * @method buildSystemPrompt
  * @static
  */
@@ -294,12 +441,6 @@ function buildSystemPrompt(options) {
     return parts.systemPrefix + (parts.instructions ? '\n\n' + parts.instructions : '');
 }
 
-/**
- * Cache key for the current schema version. Use as the cacheKey argument to
- * adapter.executeWithCachedPrefix(). Changes when the schema file is modified.
- * @method getSchemaCacheKey
- * @static
- */
 function getSchemaCacheKey() {
     _loadSchema();
     return 'ai-pipeline-schema-v' + Math.floor(_schemaMtm / 1000);
@@ -309,10 +450,12 @@ function getSchema()    { return _loadSchema(); }
 function reloadSchema() { _schema = null; _cachedPrefix = null; return _loadSchema(); }
 
 module.exports = {
-    buildQueryPrompt:  buildQueryPrompt,
-    buildSystemPrompt: buildSystemPrompt,
-    getSchemaCacheKey: getSchemaCacheKey,
-    getSchema:         getSchema,
-    reloadSchema:      reloadSchema,
-    CATEGORIES:        CATEGORIES
+    buildQueryPrompt:    buildQueryPrompt,
+    buildSystemPrompt:   buildSystemPrompt,
+    getSchemaCacheKey:   getSchemaCacheKey,
+    getSchema:           getSchema,
+    reloadSchema:        reloadSchema,
+    CATEGORIES:          CATEGORIES,
+    // Exposed so callers can inspect the schema or use it in tests
+    _buildResponseSchema: _buildResponseSchema
 };

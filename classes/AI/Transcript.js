@@ -15,6 +15,7 @@
  * @class AI.Transcript
  * @static
  */
+var Q = require('Q');
 var Session = Q.require('Streams/Transcript/Session');
 var Pipeline = Q.require('AI/Pipeline');
 var VetoQueue = Q.require('AI/VetoQueue');
@@ -22,6 +23,29 @@ var CueAudio = Q.require('AI/CueAudio');
 var transcriptEmitter = Q.require('Streams/TranscriptEmitter').transcriptEmitter;
 
 function Transcript() {}
+
+
+// Set of intents that benefit from rolling-context (recent3) fallback because
+// the user may pause between the trigger verb and the parameter:
+//   "go to the … pricing slide"          → slide/navigate {query: 'pricing'}
+//   "rewind … thirty seconds"            → video/seek/relative {time}
+//   "highlight … the third bar"          → highlight {elementId}
+//   "generate an image of … a cat"       → image/generate {prompt}
+// Simple intents without captures (slide/next, video/pause, zoom/in, etc.)
+// are self-contained single utterances — pass 2 should not match them, or
+// stale buffer entries trigger false positives ("next slide" lingering in
+// the buffer matching a new "previous slide" utterance).
+var CAPTURE_INTENTS = new Set([
+    'slide/navigate',
+    'video/seek',
+    'video/seek/relative',
+    'highlight',
+    'image/generate',
+    'tool/generate',
+    'stream/create',
+    'stream/grantAccess',
+    'stream/revokeAccess'
+]);
 
 /**
  * Run the AI layer after Streams has ingested a final utterance. Subscribed to
@@ -35,15 +59,95 @@ function Transcript() {}
  * @param {Object} Q
  * @param {Object} Users
  */
-Transcript.afterStreams = async function (session, result, AI, Q, Users) {
-    if (!result) return;
+Transcript.process = async function (session, chunk, AI, Q, Users) {
+    if (!chunk.isFinal || !chunk.transcript || !chunk.transcript.trim()) return;
 
-    // TTS cue audio for the durable record — keyed off the message ordinal.
-    if (result.ordinal != null && session.transcriptFile) {
-        CueAudio.generate(session, result.entry, result.ordinal, Q);
+    var text = chunk.transcript.trim();
+    var entry = {
+        text:    text,
+        ts:      Date.now(),
+        relSec:  Session.relSec(session),
+        speaker: chunk.speaker || session.userId,
+        isFinal: true,
+    };
+    session.transcriptBuffer.push(entry);
+    if (session.transcriptBuffer.length > 8) session.transcriptBuffer.shift();
+
+    Transcript._resolveDisplayName(session, entry.speaker, Q);
+
+    // Rolling context — catches split control commands ("go to the … roadmap slide")
+    var recent3 = session.transcriptBuffer.slice(-3).map(function (e) { return e.text; }).join(' ');
+
+    // 1) Classifier — instant, zero cost. Runs first so the flag is
+    //    available when we write the durable message + VTT cue.
+    var isControl = false;
+    if (session.role === 'host' && session.modes.navigation !== false) {
+        var classifyState = {
+            slideIndex:      session.slideIndex,
+            revealIndex:     session.revealIndex,
+            zoomScale:       session.zoomScale,
+            userId:          session.userId,
+            publisherId:     session.publisherId,
+            streamName:      session.streamName,
+            toolStreamName:  session.toolStreamName || null,
+            toolPublisherId: session.userId,
+            // Full session reference for handlers that need session-internal
+            // fields (sessionStartMs for relSec, transcriptFile for VTT cues,
+            // _displayNames for speaker tags). ControlClassifier ignores this
+            // — only command handlers reach in via state.session.
+            session:         session,
+            sessionStartMs:  session.sessionStartMs,
+            Q:               Q,
+            Users:           Users,
+        };
+        var proxy = session.publisherId ? StreamProxy.make(session, Q, Users) : null;
+        if (proxy && session.classifier.classify(recent3, proxy, classifyState)) {
+            isControl = true;
+        }
     }
 
-    // AI event bus — internal listeners that want every utterance.
+    // 2) Durable transcript message + VTT cue
+    if (session.publisherId && session.streamName) {
+        Session.postMessage(Q, {
+            publisherId:  session.publisherId,
+            streamName:   session.streamName,
+            byUserId:     entry.speaker || session.userId,
+            type:         'Media/presentation/transcript',
+            content:      entry.text,
+            instructions: JSON.stringify({
+                speaker:    entry.speaker || session.userId,
+                relSec:     entry.relSec,
+                isFinal:    true,
+                confidence: chunk.confidence || 1,
+                control:    isControl || undefined,
+            }),
+        }, function (err, message) {
+            var ordinal = (!err && message) ? message.fields.ordinal : null;
+            transcriptEmitter.emitChunk(session, entry, ordinal, { control: isControl });
+            if (ordinal != null && session.transcriptFile) {
+                CueAudio.generate(session, entry, ordinal, Q);
+            }
+        });
+    } else {
+        transcriptEmitter.emitChunk(session, entry, null, { control: isControl });
+    }
+
+    // 3) Chat-style transcript post — each person posts under their own userId
+    if (session.modes.transcription !== false && session.publisherId && session.streamName) {
+        Session.postMessage(Q, {
+            publisherId:  session.publisherId,
+            streamName:   session.streamName,
+            byUserId:     entry.speaker || session.userId,
+            type:         'Streams/chat/message',
+            content:      entry.text,
+            instructions: JSON.stringify({
+                isTranscript: true,
+                relSec:       entry.relSec,
+                control:      isControl || undefined,
+            }),
+        });
+    }
+
     AI.emit('transcript',
         session.userId, session.publisherId, session.streamName,
         Object.assign({}, result.entry));
@@ -64,13 +168,7 @@ Transcript._processChunk = async function (session, text, AI, Q, Users) {
     if (!session.pipeline) {
         session.pipeline = new Pipeline({
             Q: Q,
-            session: {
-                role:        session.role,
-                publisherId: session.publisherId,
-                streamName:  session.streamName,
-                userId:      session.userId,
-                socket:      session.socket
-            },
+            session: session,
             emitToUser: function (userId, event, data) {
                 Users.Socket.emitToUser(userId, event, data);
             },
@@ -142,8 +240,8 @@ Transcript._onTopicChange = function (session, fromTopic, toTopic, AI, Q, Users)
             publisherId:  session.publisherId,
             streamName:   session.streamName,
             byUserId:     session.userId,
-            type:         'AI/topic',
-            instructions: JSON.stringify({ from: fromTopic, to: toTopic, relSec: topicRelSec })
+            type:         'Media/presentation/topic',
+            instructions: JSON.stringify({ from: fromTopic, to: toTopic, relSec: topicRelSec }),
         });
     }
 };

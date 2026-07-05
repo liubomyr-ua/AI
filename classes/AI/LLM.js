@@ -201,6 +201,30 @@ AI_LLM.extractEntities = function (text) {
 		}
 	}
 
+    var KNOWN_PLACES = /\b(Tokyo|Kyoto|Osaka|Paris|London|Madrid|Rome|Berlin|Vienna|Amsterdam|Prague|Athens|Lisbon|Dublin|Stockholm|Oslo|Helsinki|Copenhagen|Moscow|Istanbul|Cairo|Lagos|Nairobi|Johannesburg|Beijing|Shanghai|Seoul|Bangkok|Singapore|Mumbai|Delhi|Karachi|Tehran|Riyadh|Dubai|Jakarta|Manila|Sydney|Melbourne|Auckland|Toronto|Vancouver|Montreal|Boston|Chicago|Miami|Seattle|Portland|Austin|Denver|Detroit|Philadelphia|Houston|Dallas|Phoenix|Atlanta|Honolulu|Reykjavik|Marrakech|Casablanca|Bali|Maldives|Fiji|Hawaii|Iceland|Norway|Sweden|Finland|Denmark|Iceland|Japan|China|India|Brazil|Argentina|Chile|Peru|Mexico|Canada|Australia|Egypt|Morocco|Greece|Italy|Spain|Portugal|France|Germany|Austria|Switzerland|Netherlands|Belgium|Ireland|Scotland|Wales|England|Russia|Ukraine|Poland|Hungary|Romania|Turkey|Israel|Jordan|Lebanon|Vietnam|Thailand|Indonesia|Philippines|Malaysia|Cambodia|Laos|Myanmar|Nepal|Bhutan|Mongolia|Kenya|Tanzania|Ethiopia|Madagascar|Iceland|Greenland|Antarctica|Patagonia|Yosemite|Yellowstone|Grand Canyon|Niagara|Everest|Kilimanjaro|Fuji|Mount Fuji|Eiffel Tower|Great Wall|Taj Mahal|Machu Picchu|Petra|Stonehenge|Colosseum|Pyramids|Statue of Liberty|Times Square|Brooklyn Bridge|Golden Gate|Hollywood|Vegas|Manhattan|Brooklyn|Queens|Bronx|Soho|Chelsea|Tribeca|Harlem|Sahara|Amazon|Himalayas|Alps|Andes|Rockies|Pyrenees|Atlas|Carpathians|Mediterranean|Caribbean|Pacific|Atlantic|Arctic|Antarctic|Sahel|Outback|Tundra|Savanna|Galapagos|Serengeti|Yucatan|Galápagos)\b/g;
+    var places = [];
+    while ((m = KNOWN_PLACES.exec(text)) !== null) {
+        var place = m[1].trim();
+        // Skip if this place was already captured as part of a person name
+        // (e.g. "Michael Jordan" — Jordan is the person's surname, not a place)
+        var alreadyAsPerson = persons.some(function (p) {
+            return p.split(/\s+/).indexOf(place) !== -1;
+        });
+        if (!alreadyAsPerson && !places.includes(place)) {
+            places.push(place);
+        }
+    }
+
+    var SEASONS_WEATHER = /\b(autumn|spring|summer|winter|fall|monsoon|dry season|rainy season|sunset|sunrise|dawn|dusk|twilight|midnight|noon)\b/gi;
+
+    // In extractEntities:
+    var modifiers = [];
+    while ((m = SEASONS_WEATHER.exec(text)) !== null) {
+        var mod = m[0].toLowerCase().trim();
+        if (!modifiers.includes(mod)) modifiers.push(mod);
+    }
+
+
 	// Hashtags (already structured)
 	var hashtags = [];
 	var hashRe = /#([A-Za-z][A-Za-z0-9_]{1,30})/g;
@@ -208,7 +232,7 @@ AI_LLM.extractEntities = function (text) {
 		hashtags.push(m[1]);
 	}
 
-	return { persons: persons, orgs: orgs, topics: topics, numbers: numbers, hashtags: hashtags };
+	return { persons: persons, places: places, orgs: orgs, topics: topics, numbers: numbers, hashtags: hashtags, modifiers: modifiers };
 };
 
 /**
@@ -256,6 +280,16 @@ AI_LLM.buildSearchQueries = function (entities, contextHint) {
 			queries.push(t);
 		});
 	}
+
+    // Places — direct query, optionally with seasonal/context hint
+    entities.places && entities.places.forEach(function (p) {
+        if (entities.modifiers && entities.modifiers.length) {
+            queries.push(p + ' ' + entities.modifiers[0]);
+        } else if (contextHint) {
+            queries.push(p + ' ' + contextHint);
+        }
+        queries.push(p);
+    });
 
 	// Deduplicate and limit
 	var seen = {};
