@@ -72,14 +72,14 @@ AI_Image.Openai.JPEG_QUALITY = 85;
  *       images: [baseImage],
  *       model: 'dall-e-2',
  *       format: 'png'
- *   }).then(function(res) { /* ... */ });
+ *   }).then(function(res) { ... });
  *
  * @example
  *   // Face generation with smart prompt
  *   ai.generate(AI_Image.promptFace('cat'), {
  *       images: [userPhotoBuffer],
  *       format: 'png'
- *   }).then(function(res) { /* ... */ });
+ *   }).then(function(res) { ... });
  */
 AI_Image.Openai.prototype.generate = function (prompt, options) {
 	options   = options || {};

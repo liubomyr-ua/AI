@@ -76,7 +76,7 @@ AI_Image.Google.JPEG_QUALITY = 85;
  *       format: 'png',
  *       feather: 15,
  *       bgColor: '#ffffff'
- *   }).then(function(res) { /* ... */ });
+ *   }).then(function(res) { ... });
  *
  * @example
  *   // Image-guided generation using reference image
@@ -86,7 +86,7 @@ AI_Image.Google.JPEG_QUALITY = 85;
  *       width: 1536,
  *       height: 1024,
  *       background: 'transparent'
- *   }).then(function(res) { /* ... */ });
+ *   }).then(function(res) { ... });
  *
  * @example
  *   // Composite over gradient background
@@ -95,7 +95,7 @@ AI_Image.Google.JPEG_QUALITY = 85;
  *       format: 'png',
  *       width: 1200,
  *       height: 630
- *   }).then(function(res) { /* ... */ });
+ *   }).then(function(res) { ...  });
  */
 AI_Image.Google.prototype.generate = function (prompt, options) {
 	options  = options || {};

@@ -167,7 +167,7 @@ AI_Image.ANIMALS = [
  *   // Automatic animal selection (random from 100 curated list)
  *   var prompt = AI_Image.promptFace();
  *   ai.generate(prompt, {images: [photoBuffer], background: 'transparent'})
- *     .then(function(res) { /* ... */ });
+ *     .then(function(res) { ... });
  *
  * @example
  *   // Specific animal fallback for consistent branding
@@ -176,7 +176,8 @@ AI_Image.ANIMALS = [
  *       images: [fs.readFileSync('user.jpg')],
  *       format: 'png',
  *       background: 'transparent'
- *   }).then(function(res) { /* ... */ });
+
+ *   }).then(function(res) { ... });
  *
  * @example
  *   // Use with Google adapter for best results (native transparency support)
@@ -185,7 +186,7 @@ AI_Image.ANIMALS = [
  *       images: [userPhotoBuffer],
  *       background: 'transparent',
  *       feather: 20
- *   }).then(function(res) { /* {data: Buffer, format: 'png'} */ });
+ *   }).then(function(res) { {data: Buffer, format: 'png'} });
  *
  * @example
  *   // Fallback handling: NSFW or non-face input → cute animal instead
