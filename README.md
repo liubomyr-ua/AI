@@ -1,124 +1,91 @@
 # AI Plugin
 
-Qbix AI plugin. Provides LLM, image, transcription, and realtime voice provider adapters with config-driven routing.
+Provider-agnostic AI infrastructure for the Qbix platform — LLM execution, image generation, realtime voice, speech-to-text transcription, structured observation processing, and a live transcript intelligence pipeline. The plugin defines clean interface contracts for each capability and routes through deployment-configured provider adapters, so application code never touches provider-specific APIs directly.
 
-## What's new in this round
+## Core Concepts
 
-### Cloud-neutral LLM routing
+### LLM Execution
 
-`AI_LLM::route('smart')` (PHP) and `AI_LLM.route('smart')` (JS) resolve a logical route name to the deployment-configured backend. Consumers don't need to know if smart-routed LLM is Anthropic-direct, Anthropic-on-Bedrock, Anthropic-on-Vertex, OpenAI, Gemini, or local Llama. Configure once per deployment; consumers stay portable.
+`AI_LLM` defines a single primitive: `executeModel($instructions, $inputs, $options)` — exactly one RPC per call, no retries, no batching, no orchestration. The interface abstracts the conversation semantics across providers: system/developer instructions map to OpenAI's `instructions`, Anthropic's `system`, and Gemini's `system_instruction`. Messages use a canonical `{role, content}` shape that adapters translate.
 
-New LLM adapters this round (PHP + JS twins for sandbox-callable):
+The `$inputs` array carries multimodal artifacts — images, PDFs, audio, video, and arbitrary artifacts — as binary data, not URLs. The `$options` array carries execution parameters (model, temperature, max_tokens, response_format, json_schema) and the conversation timeline (messages array with user/assistant/tool roles).
 
-- **`AI_LLM_Anthropic`** — direct api.anthropic.com. Implements `AI_LLM_AdvancedInterface` for prompt caching via `cache_control`.
-- **`AI_LLM_VertexAi`** — Google Cloud Vertex AI. Auto-dispatches by model name's publisher segment to Gemini / Anthropic-on-Vertex / Llama-on-Vertex. Auth via service account JSON, pre-acquired access token, or Workload Identity metadata server.
-- **`AI_LLM_Local`** — OpenAI-compatible local servers (vLLM, llama-cpp-server, Ollama, LM Studio, generic). Subtype dispatch for KV-cache control: prefix caching, prewarm, list, evict. SSRF allowlist guards against config-drift attacks against arbitrary internal hosts.
+**Factory and routing.** `AI_LLM::create($adapter)` instantiates an adapter by class name. `AI_LLM::route($routeName)` resolves a deployment-configured route (e.g. "smart", "fast", "search", "vision") to a provider definition (class + config) and returns an instance with merged options. Route names are deployment conventions — the same application code runs against Anthropic direct, AWS Bedrock, Google Vertex AI, or a local vLLM server by changing config.
 
-Plus the existing `AI_LLM_Openai`, `AI_LLM_Aws` (Bedrock), `AI_LLM_Google` (AI Studio Gemini).
+**Provider adapters:** Anthropic (direct API with prompt caching via `AI_LLM_AdvancedInterface`), OpenAI (Responses API), Google (Gemini via AI Studio or Vertex), AWS (Bedrock), VertexAI (Anthropic, Gemini, and Llama on Vertex), Local (vLLM and compatible OpenAI-compat servers). Each adapter lives in `AI/LLM/{Adapter}.php` and `AI/LLM/{Adapter}.js` with identical factory semantics on both sides.
 
-See `config/AI-sample.json` for a complete routing example and `ADAPTER_GUIDE.md` for adding new providers.
+**Web search.** Adapters that support built-in web search declare `supportsWebSearch() = true` and accept `options.webSearch` (true or `{maxUses, contextSize, allowedDomains, userLocation}`). The `"search"` route implies webSearch automatically. `searchAndRespond($instructions, $query)` provides a high-level helper.
 
-### Two-tier interface
+**Structured outputs.** `options.response_format = 'json_schema'` with `options.json_schema` engages provider-native constrained decoding. `AI_LLM::makeStrict()` normalizes schemas for strict-mode providers. `AI_LLM::geminiSchema()` strips `additionalProperties` for Gemini's OpenAPI-subset.
 
-```php
-$llm = AI_LLM::route('smart');
+### Observations System
 
-// Common surface — works for all providers
-$resp = $llm->executeModel($systemPrompt, $inputs, $options);
+Observations are config-driven semantic evaluators. Each observation defines a `promptClause` (what to evaluate), `fieldNames` (output fields), and an optional `example` (for schema inference). Observations are loaded from JSON files via `AI.observations` config and processed via `AI_LLM::process($inputs, $observations)`.
 
-// Advanced surface — for providers that implement AI_LLM_AdvancedInterface
-if ($llm instanceof AI_LLM_AdvancedInterface) {
-    $resp = $llm->executeWithCachedPrefix('cache-key', $systemPrefix, $inputs, $options);
-}
-if ($llm instanceof AI_LLM_AdvancedInterface && $llm->supportsPrefixCache()) {
-    $llm->prewarmPrefix('cache-key', $systemPrefix);
-}
-```
+The process method builds a structured prompt with all observation clauses and a JSON schema, sends it to the LLM, and returns typed results. `AI_LLM::promptFromObservations()` generates the prompt and example schema. `AI_LLM::jsonSchemaFromObservations()` generates a strict JSON Schema for constrained decoding. Observations support interpolation via `Q::interpolate()` with variables like `{{currentYear}}`, `{{communityId}}`.
 
-Hosted providers (Anthropic, Vertex Anthropic) partially implement Advanced — they support `executeWithCachedPrefix` via the provider's native cache_control, but throw `AI_LLM_Exception_NotSupported` for `prewarmPrefix`, `listCachedPrefixes`, `dropCachedPrefix` because the underlying API doesn't expose those.
+The built-in observation set (`config/observations.json`) covers image analysis: basic description (title + content), holiday detection (semantic extraction, holiday importance, timing), language quality (spelling, expressions), cultural relevance (countries, specificity), content classification (type, occasion, tone, sentiment), aesthetic quality, and safety flags (obscene, controversial, confidence).
 
-Local providers fully implement Advanced when subtype is `vllm`, `llama-cpp`, or `sglang`. Generic OpenAI-compat and Ollama subtypes are second-class — `supportsPrefixCache()` returns false and the advanced methods fall back to plain execution or throw NotSupported.
+`AI_LLM::createStream()` ties it together: runs observations, filters through a policy gate (`accept()` rejects obscene > 3, controversial > 5, confidence < 0.6), and creates a Qbix stream with the observation results as attributes.
 
-### Realtime voice layer
+### Named Entity Recognition
 
-New category for realtime speech-to-speech voice agents. Architecturally different from batch LLM: the audio flows over a persistent WebSocket or WebRTC connection between the browser/iframe and the provider, not through the server.
+`AI_LLM::extractEntities($text)` provides lightweight regex-based NER that runs before any LLM call, returning `{persons, orgs, topics, numbers, hashtags}`. Persons are detected via Title Case word sequences with stopword filtering. Orgs match known suffixes (Inc, Corp, LLC, Labs, AI, etc.) and all-caps acronyms. Numbers capture values with units (billion, percent, etc.). Topics follow indicator words (about, discussing, regarding).
 
-Server-side broker (PHP) issues ephemeral tokens. Browser-side client (JS) speaks the provider's session protocol.
+`AI_LLM::buildSearchQueries($entities)` converts extracted entities into priority-ordered search queries for Pexels/Pixabay/archive lookups — no LLM cost. `AI_LLM::lookupStreams($names)` matches entity names against Qbix `Streams_Avatar` rows via prefix search for cheap entity linking.
 
-Server-side adapters:
+### Summarization & Keywords
 
-- **`AI_Voice_Openai`** — OpenAI Realtime API. WebRTC preferred for browsers, WebSocket for server-to-server. Ephemeral tokens via `POST /v1/realtime/client_secrets`.
-- **`AI_Voice_AzureOpenai`** — Azure OpenAI Service Realtime. Same wire format as OpenAI but Azure region endpoints + Entra ID or api-key auth.
-- **`AI_Voice_Xai`** — xAI Grok Voice Think Fast 1.0. OpenAI-Realtime wire-compatible. WebSocket-only (no WebRTC as of May 2026). Subprotocol-based token auth.
-- **`AI_Voice_Gemini`** — Google Gemini Live API. Different wire format (`setup`/`clientContent`/`realtimeInput`/`serverContent`). Operates in **proxy mode** — your server forwards to Gemini using server-side auth, since Gemini doesn't issue client-safe ephemeral tokens.
-- **`AI_Voice_Local`** — self-hosted gateway (Pipecat or LiveKit Agents). Mints HMAC-signed JWT tokens; your gateway validates them on connect. SSRF allowlist for the gateway URL.
+`AI_LLM::summarize($text)` extracts title, keywords, summary, and speakers from text using XML-tagged output. `AI_LLM::keywords($keywords, $during)` expands canonical keywords into related search terms — broader during insert time, narrower during query time. Supports multilingual expansion with native-language output.
 
-Browser-side client:
+### Image Generation
 
-```javascript
-// 1. Server returns the session object to the browser:
-//    { token, wsUrl, wrtcUrl, protocol, model, expiresAt, mode, session, ... }
-var session = await fetch('/api/voice/session', { method: 'POST' }).then(r => r.json());
+`AI_Image` defines `generate($prompt, $options)` and `removeBackground($image, $options)`. Adapters: OpenAI (DALL-E 3), AWS (Bedrock Stable Diffusion), Google (Vertex AI with transparent background support), Hotpotai, Ideogram, Removebg. The factory and routing follow the same `create()`/`route()` pattern as LLM.
 
-// 2. Browser code:
-var voice = new AI.Voice(session);
+### Realtime Voice
 
-voice.on('open',      ()      => console.log('voice ready'));
-voice.on('audio',     b64chunk => playAudioChunk(b64chunk));
-voice.on('transcript', t      => {
-    // t.role: 'user' | 'assistant'
-    // t.text: string (delta)
-    // t.isFinal: boolean
-    console.log(`[${t.role}] ${t.text}`);
-});
-voice.on('toolCall',  call    => {
-    const result = await handleTool(call.name, call.arguments);
-    voice.respondToToolCall(call.callId, result);
-});
-voice.on('error',     err     => console.error(err));
+`AI_Voice` brokers realtime voice sessions. The server issues ephemeral tokens scoped to a session configuration (voice, instructions, VAD, tools), and the browser connects directly to the provider — the server never proxies audio. `createSession($params)` returns `{token, wsUrl, protocol, model, expiresAt, mode}`. The `protocol` field drives client-side dispatch to the correct `AI.Voice.<Protocol>` class.
 
-await voice.connect();
-await voice.startMicrophone();  // browser captures and forwards audio
-// ... user talks; events flow ...
-voice.sendText('Switch language to Spanish, please.');
-voice.close();
-```
+Adapters: OpenAI Realtime (`openai-realtime` protocol), Gemini Live (`gemini-live`, proxy mode since Gemini doesn't issue client-safe tokens), Elevenlabs, Pipecat, LiveKit, Azure OpenAI. Client-side adapters in `web/js/AI/Voice/` handle WebSocket/WebRTC connection per protocol.
 
-The `AI.Voice` class dispatches to a per-protocol implementation based on `session.protocol`:
+### Transcription (Speech-to-Text)
 
-- `openai-realtime` → `AI.Voice.OpenaiRealtime` (handles OpenAI + xAI + Azure)
-- `gemini-live` → `AI.Voice.GeminiLive`
-- `pipecat` → `AI.Voice.Pipecat`
-- `livekit` → `AI.Voice.LiveKit` (requires livekit-client SDK loaded)
+`AI_Transcription` defines `transcribe($source, $options)` and `fetch($transcriptId)`. Adapters: AssemblyAI (with webhook-based async), OpenAI (Whisper), AWS, Xai. For realtime streaming, `AI_Transcription_DeepgramStream` and `AI_Transcription_AssemblyaiStream` run on the Node.js process, receiving mic audio via the Qbix socket.
 
-### iframe / postMessage bridge
+Client-side speech recognition is configured via `AI.speech.provider`: `"deepgram"` routes mic audio through the socket server; `"browser"` or null uses native `SpeechRecognition`. Config: `sampleRate` (default 16000), `chunkMs` (default 100).
 
-For embedded use:
+### Intelligence Pipeline
 
-```javascript
-// In iframe page:
-AI.Voice.attachPostMessageBridge(window.parent, 'https://parent.example.com');
+`AI/Pipeline.js` implements a live transcript intelligence pipeline: NER → fast lookup → cached LLM query → proposal. It uses a schema-driven prompt system (`AI/Prompt.js` builds prompts from `messages.schema.json`) with KV cache optimization — the ~2900-token static schema prefix is byte-stable across calls and cached at 0.1× price on Anthropic (5-min TTL). The per-call dynamic part (role, context, intent constraint) is only ~20–60 tokens.
 
-// In parent page:
-iframe.contentWindow.postMessage({
-    type: 'voice.connect',
-    session: sessionObject
-}, '*');
-iframe.contentWindow.postMessage({ type: 'voice.startMic' }, '*');
+Intent detection uses regex heuristics: comparison, definition, statistics, slide generation, map/directions, and wake word detection. The pipeline emits proposals that can be vetoed (via `AI/VetoQueue.js`) before execution.
 
-window.addEventListener('message', e => {
-    if (e.data.type === 'voice.transcript') console.log(e.data.text);
-    if (e.data.type === 'voice.toolCall') handleTool(e.data);
-});
-```
+### Session Management
 
-This lets a parent app drive a voice session inside an embedded iframe without each iframe needing its own provider keys.
+`AI/Session.js` maintains per-socket AI session state with a 60-second grace period for reconnection. Sessions are keyed by both socket ID (current binding) and session token (stable identity). On reconnect, the session rebinds to the new socket without losing state.
 
-## Routing config
+### Discourse Integration
 
-See `config/AI-sample.json` for a complete example with all providers.
+`AI/discourse/post.php` generates AI-powered forum replies with selectable attitudes: agree+actionable, agree+emotive, agree+expand, agree+changeSubject, disagree+respectful, disagree+emotive, disagree+absurd, disagree+authority. Posts the generated reply back to the Discourse forum and saves a record to Streams.
 
-Pattern:
+### Stream Commands
+
+The plugin registers Streams commands for AI-powered content generation: `AI/image/generate` (background routing), `AI/tool/generate` (veto routing), `AI/slide/generate` (veto routing — AI-composed HTML slides with web search images).
+
+## Provider Adapters
+
+| Subsystem | Adapters |
+|---|---|
+| LLM | Anthropic, OpenAI, Google, AWS (Bedrock), VertexAI, Local |
+| Image | OpenAI (DALL-E), AWS, Google, Hotpotai, Ideogram, Removebg |
+| Voice | OpenAI Realtime, Gemini Live, Elevenlabs, Pipecat, LiveKit, Azure OpenAI |
+| Transcription | AssemblyAI, OpenAI, AWS, Xai, DeepgramStream, AssemblyaiStream |
+
+## Database
+
+No custom tables. Observation results are stored as stream attributes. Pipeline state uses Streams infrastructure. Session state is in-memory (Node.js process).
+
+## Configuration
 
 ```json
 {
@@ -126,50 +93,18 @@ Pattern:
         "llm": {
             "default": "anthropic-direct",
             "providers": {
-                "anthropic-direct":  { "class": "Anthropic", "config": {...} },
-                "anthropic-vertex":  { "class": "VertexAi",  "config": {...} },
-                "openai-direct":     { "class": "Openai",    "config": {...} },
-                "llama-vllm-local":  { "class": "Local",     "config": {...} }
+                "anthropic-direct": { "class": "Anthropic", "config": { "model": "claude-sonnet-4-6" } },
+                "openai-direct":    { "class": "Openai",    "config": { "model": "gpt-4.1-mini" } },
+                "gemini-vertex":    { "class": "VertexAi",  "config": { "model": "publishers/google/models/gemini-2.5-pro" } }
             },
-            "routes": {
-                "smart":        "anthropic-direct",
-                "smart-cached": "llama-vllm-local",
-                "fast":         "openai-direct",
-                "long-context": "anthropic-vertex"
-            }
+            "routes": { "smart": "anthropic-direct", "fast": "openai-direct", "search": "anthropic-direct" }
         },
-        "voice": {
-            "default": "openai-realtime",
-            "providers": {
-                "openai-realtime": { "class": "Openai", "config": {...} },
-                "xai-grok-voice":  { "class": "Xai",    "config": {...} },
-                "gemini-live":     { "class": "Gemini", "config": {...} },
-                "local-pipecat":   { "class": "Local",  "config": {...} }
-            },
-            "routes": {
-                "conversational": "openai-realtime",
-                "reasoning":      "xai-grok-voice",
-                "local":          "local-pipecat"
-            }
-        }
+        "image":  { "default": "openai", "providers": { "openai": { "model": "dall-e-3" } } },
+        "voice":  { "provider": "openai" },
+        "speech": { "provider": "deepgram", "sampleRate": 16000, "chunkMs": 100 },
+        "transcription": { "provider": "assemblyai" },
+        "anthropic": { "apiKey": "..." },
+        "openAI":    { "key": "..." }
     }
 }
 ```
-
-A deployment running on GCP would set `anthropic-vertex` as default; on AWS, `anthropic-bedrock`; on Azure, `anthropic-direct` or `azure-openai`. The application code calling `AI_LLM::route('smart')` doesn't change.
-
-## What's NOT in this round
-
-Honest scope notes:
-
-- **No real-endpoint testing.** All code is syntax-clean and built against documented provider specs (cross-referenced May 2026), but none has been run against live endpoints. Expect debugging when you integrate. Likely failure surfaces: header names, payload field casing, response shape variation between providers' beta/GA versions.
-- **No Azure AI Foundry, Oracle Generative AI, or watsonx.ai LLM adapters yet** — the Azure/Oracle/IBM long tail. Add them following `ADAPTER_GUIDE.md`.
-- **No image-generation routing yet.** Existing `AI_Image_*` adapters work; new providers (Vertex Imagen, Stability direct, Azure DALL-E, local SD) aren't wired into a router. Same pattern applies; future round.
-- **No transcription routing yet.** Same deferral.
-- **Voice provider catalog is current as of May 2026.** Anthropic does NOT publish a realtime voice API. If you need Claude as voice, pipeline through Pipecat: STT → Claude → TTS. Or wait for Anthropic to ship one.
-- **OpenAI's WebRTC SDP renegotiation when adding mic track post-connect.** The protocol client adds the track but may need explicit renegotiation in some browsers. Most browsers handle implicitly via `onnegotiationneeded`; if your case breaks, the fix is calling `pc.setLocalDescription(await pc.createOffer())` after `addTrack`.
-- **Pipecat wire format assumed defaults.** Your Pipecat deployment may publish events differently. Customize `AI.Voice.Pipecat._handleEvent` for your event vocabulary, or use LiveKit transport instead.
-
-## Adding new providers
-
-See `ADAPTER_GUIDE.md` for the pattern. Pair every PHP adapter with a JS adapter for sandbox-callable use. Test against real endpoints before shipping.
