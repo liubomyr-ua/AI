@@ -74,12 +74,6 @@ class AI_Transcription implements AI_Transcription_Interface
             return new $className($options);
         }
 
-        // Try alternative: prefix without underscore (legacy variations)
-        $altClass = "AI_Transcription_" . $suffix;
-        if (class_exists($altClass)) {
-            return new $altClass($options);
-        }
-
         // Not found — rely on autoloader to load file by convention if needed,
         // otherwise return null so caller can handle.
         return null;
