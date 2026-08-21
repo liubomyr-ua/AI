@@ -312,12 +312,6 @@ class AI_Image implements AI_Image_Interface
 			return new $className($options);
 		}
 
-		// Try alternative: prefix without underscore (legacy variations, if needed)
-		$altClass = "AI_Image_" . $suffix;
-		if (class_exists($altClass)) {
-			return new $altClass($options);
-		}
-
 		// Not found — rely on autoloader to load file by convention if needed,
 		// otherwise return null so caller can handle.
 		return null;

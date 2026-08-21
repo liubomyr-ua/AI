@@ -343,12 +343,6 @@ abstract class AI_LLM implements AI_LLM_Interface
             return new $className($options);
         }
 
-        // Try alternative: prefix without underscore (legacy variations)
-        $altClass = "AI_LLM_" . $suffix;
-        if (class_exists($altClass)) {
-            return new $altClass($options);
-        }
-
         // Not found — rely on autoloader to load file by convention if needed,
         // otherwise return null so caller can handle.
         return null;
