@@ -293,7 +293,7 @@ AI.listen = function () {
 
 AI._processLLMResult = function (session, result, entry) {
     if (!result) return;
-    //console.log('LLM: result action', result.action);
+    console.log('LLM: result action', result.action);
     //console.log('LLM: result visualizationType', result.visualizationType);
     //console.log('LLM: result confidence', result.confidence);
 

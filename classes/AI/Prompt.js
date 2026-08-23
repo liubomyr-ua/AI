@@ -17,9 +17,10 @@
  * @static
  */
 
-var Q    = require('Q');
-var fs   = require('fs');
-var path = require('path');
+var Q         = require('Q');
+var fs        = require('fs');
+var path      = require('path');
+var Tokenizer = require('./Tokenizer');
 
 // -- Schema loading ----------------------------------------------------------
 
@@ -129,6 +130,65 @@ function _renderAllEphemerals(schema) {
     return lines.join('\n');
 }
 
+/**
+ * Render the contextSummary field definitions + example from the schema into
+ * prompt text for the "ROLLING CONTEXT SUMMARY" section of the static prefix.
+ */
+function _renderContextSummarySchema(schema) {
+    var cs = schema.contextSummary || {};
+    var lines = [];
+    if (cs.instructions) lines.push(cs.instructions);
+    var fields = cs.fields || {};
+    lines.push('');
+    lines.push('Fields:');
+    Object.keys(fields).forEach(function (fn) {
+        var spec = fields[fn];
+        lines.push('  ' + fn + ' (' + (spec.type || 'string') + ', required): ' +
+            (spec.description || ''));
+    });
+    if (cs.example != null) {
+        lines.push('');
+        lines.push('Example:');
+        lines.push(JSON.stringify(cs.example, null, 2));
+    }
+    return lines.join('\n');
+}
+
+// -- Rolling context summary ("older context") --------------------------------
+
+/**
+ * Render the previous contextSummary object (or null on the first call of a
+ * session) into the "OLDER CONTEXT" block placed in the per-call instructions.
+ * Exported so callers doing token-budget math (TranscriptBuffer) can measure
+ * the exact text that will be sent, rather than approximating it.
+ *
+ * @method renderOlderContext
+ * @static
+ * @param {Object|null} summary  A contextSummary object, or null/undefined.
+ * @return {String}
+ */
+function renderOlderContext(summary) {
+    if (!summary || typeof summary !== 'object' ||
+        (!(summary.key_entities || []).length &&
+         !(summary.topic_timeline || []).length &&
+         !summary.running_narrative)) {
+        return 'OLDER CONTEXT: (none yet -- this is the start of the talk.)';
+    }
+    var lines = ['OLDER CONTEXT (carry forward; update only what the transcript below changed):'];
+    if (summary.key_entities && summary.key_entities.length) {
+        lines.push('Key entities:');
+        summary.key_entities.forEach(function (e) { lines.push('- ' + e); });
+    }
+    if (summary.topic_timeline && summary.topic_timeline.length) {
+        lines.push('Topic timeline:');
+        summary.topic_timeline.forEach(function (t) { lines.push('- ' + t); });
+    }
+    if (summary.running_narrative) {
+        lines.push('Narrative: ' + summary.running_narrative);
+    }
+    return lines.join('\n');
+}
+
 // -- JSON schemas for structured output --------------------------------------
 
 /**
@@ -161,7 +221,7 @@ function _buildResponseSchema() {
             'action', 'confidence', 'routing',
             'visualizationType', 'visualizationData',
             'ephemeralType', 'ephemeralPayload',
-            'coachingText', 'sourceUri'
+            'coachingText', 'sourceUri', 'contextSummary'
         ],
         properties: {
 
@@ -218,6 +278,32 @@ function _buildResponseSchema() {
             sourceUri: {
                 type: ['string', 'null'],
                 description: 'Optional source URL when relevant.'
+            },
+
+            contextSummary: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['key_entities', 'topic_timeline', 'running_narrative'],
+                description:
+                    'ALWAYS present, every turn, regardless of action. Rigid ' +
+                    '(non-freeform) structure to avoid compression loss across ' +
+                    'repeated re-summarization -- see ROLLING CONTEXT SUMMARY.',
+                properties: {
+                    key_entities: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Immutable hard facts, carried forward unchanged unless superseded.'
+                    },
+                    topic_timeline: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: '"HH:MM - topic" log, append-only, current entry marked [CURRENT].'
+                    },
+                    running_narrative: {
+                        type: 'string',
+                        description: 'Third-person prose arc of the talk so far, under 250 words.'
+                    }
+                }
             }
         }
     };
@@ -236,9 +322,21 @@ function _buildStaticPrefix() {
 
     var vizText = _renderAllVizTypes(schema);
     var ephText = _renderAllEphemerals(schema);
+    var summaryText = _renderContextSummarySchema(schema);
 
     _cachedPrefix = [
         'You are an AI assistant for a live presentation.',
+        '',
+        '## HOW YOUR INPUT IS STRUCTURED',
+        'Each turn you receive three things:',
+        '  1. This fixed system prompt (unchanging across the whole talk).',
+        '  2. An OLDER CONTEXT block -- the rolling summary of everything said',
+        '     before the transcript below (see ROLLING CONTEXT SUMMARY). Empty on',
+        '     the first turn of a session.',
+        '  3. A REAL-TIME TRANSCRIPT -- the user message: the most recent raw',
+        '     speech, chunked. It typically overlaps with transcript text you',
+        '     already saw last turn, so you can track continuity without a full',
+        '     re-read.',
         '',
         '## OUTPUT FORMAT',
         'Respond with ONE JSON object only -- no markdown fences, no preamble.',
@@ -248,6 +346,16 @@ function _buildStaticPrefix() {
         '  - "ephemeral" -> fire a control event directly (no veto)',
         '  - "coaching"  -> private hint shown only to the host',
         '  - "none"      -> nothing to show',
+        '',
+        'WAKE-WORD REQUESTS: if the REAL-TIME TRANSCRIPT (the user message) starts',
+        'with "Safebots," the speaker explicitly invoked you by name and is asking',
+        'for something to be shown -- this is a direct command, not passive',
+        'narration. Such a request MUST use action "propose" (or "ephemeral" if it',
+        'is a control command like "next slide"). NEVER answer a "Safebots," request',
+        'with "coaching" or "none" -- the host asked out loud for a visible result,',
+        'so a private-only or empty response fails the request. If you are unsure',
+        'exactly what to show, still propose your best-effort visualization rather',
+        'than falling back to coaching or none.',
         '',
         'NEVER put a visualization type (like "glossary", "stat", "comparison") in the',
         '"action" field. Those go inside "visualizationType". See examples below.',
@@ -268,10 +376,15 @@ function _buildStaticPrefix() {
         '',
         '  // when action = "coaching"',
         '  "coachingText": "..." | null,',
-        '  "sourceUri": "https://..." | null',
+        '  "sourceUri": "https://..." | null,',
+        '',
+        '  // ALWAYS included, every turn, regardless of "action" -- see',
+        '  // ROLLING CONTEXT SUMMARY below',
+        '  "contextSummary": { "key_entities": [...], "topic_timeline": [...], "running_narrative": "..." }',
         '}',
         '',
-        'Set unused fields to null. All fields must be present.',
+        'Set unused action-specific fields to null. contextSummary is never null.',
+        'All fields must be present.',
         'confidence < 0.7 -> use "none". Prefer "none" over a weak proposal.',
         'routing "privateOnly" -> host sees it, shared screen does not.',
         '',
@@ -287,7 +400,12 @@ function _buildStaticPrefix() {
         '  "ephemeralType": null,',
         '  "ephemeralPayload": null,',
         '  "coachingText": null,',
-        '  "sourceUri": null',
+        '  "sourceUri": null,',
+        '  "contextSummary": {',
+        '    "key_entities": ["Topic: Generative AI"],',
+        '    "topic_timeline": ["00:00 - Introduction to generative AI [CURRENT]"],',
+        '    "running_narrative": "The speaker introduced generative AI and defined the term for the audience."',
+        '  }',
         '}',
         '',
         '## INCORRECT EXAMPLES -- DO NOT RESPOND LIKE THESE',
@@ -314,6 +432,19 @@ function _buildStaticPrefix() {
         '',
         '---',
         '',
+        '## ROLLING CONTEXT SUMMARY',
+        'The OLDER CONTEXT block you receive each turn (above the real-time',
+        'transcript) is the "contextSummary" you returned last turn. This is how',
+        'you stay coherent across a multi-hour talk without re-reading the whole',
+        'transcript every call -- treat it as your own memory, not new speaker input.',
+        summaryText,
+        '',
+        'Structure, don\'t narrate: key_entities and topic_timeline are append-only',
+        'logs (rewrite an entry only when the transcript explicitly supersedes it);',
+        'running_narrative is the one field you may reword each turn.',
+        '',
+        '---',
+        '',
         '## IMAGES FROM WEB SEARCH',
         'When web search returns pages with images (Wikipedia infoboxes, news thumbnails,',
         'person photos), include the image URL directly inside visualizationData:',
@@ -335,16 +466,45 @@ function _buildStaticPrefix() {
         '   Set buildAuto:true and buildStagger:500 for automatic timed sequence.',
         '5. "Next slide", "scroll down", "pause" etc. -> ephemeral, not proposal.',
         '6. Respond ONLY with the JSON object.',
+        '7. Always populate contextSummary fully and accurately, every turn --',
+        '   including on "none" turns. It is your only memory of the talk so far.',
+        '8. Transcript starts with "Safebots," -> action MUST be "propose" or',
+        '   "ephemeral". Never "coaching" or "none" for a direct wake-word request.',
         '',
         '## REMINDER',
         '"action" is always exactly one of: propose, ephemeral, coaching, none.',
         '"visualizationData" and "ephemeralPayload" are plain JSON objects, never strings.',
-        'Every field must be present (set unused ones to null).',
+        'Every field must be present (set unused ones to null; contextSummary is never null).',
+        'Transcript starts with "Safebots," -> "propose" or "ephemeral", never "coaching"/"none".',
         'Re-read the CORRECT EXAMPLE above before responding.'
     ].join('\n').trim();
 
     _cachedPrefixMtm = _schemaMtm;
     return _cachedPrefix;
+}
+
+// -- Token counting ------------------------------------------------------------
+
+var _cachedPrefixTokens    = null;
+var _cachedPrefixTokensMtm = 0;
+
+/**
+ * Token count of the static system prefix, cached until the schema file
+ * changes. Used by TranscriptBuffer to budget how much of the real-time
+ * transcript window fits under a total input-token cap.
+ *
+ * @method getStaticPrefixTokenCount
+ * @static
+ * @return {Number}
+ */
+function getStaticPrefixTokenCount() {
+    var prefix = _buildStaticPrefix();
+    if (_cachedPrefixTokens != null && _cachedPrefixTokensMtm === _schemaMtm) {
+        return _cachedPrefixTokens;
+    }
+    _cachedPrefixTokens    = Tokenizer.estimateTokens(prefix);
+    _cachedPrefixTokensMtm = _schemaMtm;
+    return _cachedPrefixTokens;
 }
 
 // -- Per-call dynamic instructions -------------------------------------------
@@ -373,6 +533,12 @@ function _buildInstructions(options) {
         lines.push('Context: ' + contextHint);
     }
 
+    // "Older Context" — the rolling summary from the previous turn. Lives in
+    // the per-call (uncached) instructions block, not the static prefix,
+    // since it changes every turn. See renderOlderContext().
+    lines.push('');
+    lines.push(renderOlderContext(options.contextSummary));
+
     return lines.join('\n');
 }
 
@@ -388,6 +554,12 @@ function _buildInstructions(options) {
  *   @param {String}       [options.publisherId]
  *   @param {String}       [options.streamName]
  *   @param {String}       [options.contextHint]     One-sentence context
+ *   @param {Object}       [options.contextSummary]  Previous turn's rolling
+ *                                                   summary (contextSummary
+ *                                                   field of the last response),
+ *                                                   rendered as the "Older
+ *                                                   Context" block. Omit/null
+ *                                                   on the first turn.
  *   @param {String|Array} [options.allow='any']     Type constraint
  *   @param {Boolean}      [options.webSearch=true]
  *   @param {Number}       [options.maxTokens=2048]
@@ -447,15 +619,26 @@ function getSchemaCacheKey() {
 }
 
 function getSchema()    { return _loadSchema(); }
-function reloadSchema() { _schema = null; _cachedPrefix = null; return _loadSchema(); }
+function reloadSchema() {
+    _schema = null;
+    _cachedPrefix = null;
+    _cachedPrefixTokens = null;
+    return _loadSchema();
+}
 
 module.exports = {
-    buildQueryPrompt:    buildQueryPrompt,
-    buildSystemPrompt:   buildSystemPrompt,
-    getSchemaCacheKey:   getSchemaCacheKey,
-    getSchema:           getSchema,
-    reloadSchema:        reloadSchema,
-    CATEGORIES:          CATEGORIES,
+    buildQueryPrompt:          buildQueryPrompt,
+    buildSystemPrompt:         buildSystemPrompt,
+    getSchemaCacheKey:         getSchemaCacheKey,
+    getSchema:                 getSchema,
+    reloadSchema:              reloadSchema,
+    CATEGORIES:                CATEGORIES,
+    // Rolling context summary + token budgeting — used directly by
+    // AI/classes/AI/TranscriptBuffer.js so its budget math matches exactly
+    // what buildQueryPrompt() will actually send.
+    renderOlderContext:        renderOlderContext,
+    estimateTokens:            Tokenizer.estimateTokens,
+    getStaticPrefixTokenCount: getStaticPrefixTokenCount,
     // Exposed so callers can inspect the schema or use it in tests
     _buildResponseSchema: _buildResponseSchema
 };

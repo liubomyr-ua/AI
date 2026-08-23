@@ -6,8 +6,10 @@
  *
  * KV CACHE STRATEGY
  * ─────────────────
- * Every call uses the same ~2900-token static schema prefix (byte-stable).
- * The per-call dynamic part is ~20-60 tokens (role, context, constraint).
+ * Every call uses the same static schema prefix (byte-stable, several
+ * thousand tokens — see Prompt.getStaticPrefixTokenCount()). The per-call
+ * dynamic `instructions` block is small: role, context, constraint, plus the
+ * rolling "OLDER CONTEXT" summary (see CONTEXT BUFFERING below).
  *
  * Anthropic adapter (supportsPrefixCache = true):
  *   executeWithCachedPrefix(cacheKey, systemPrefix, inputs, {
@@ -27,12 +29,30 @@
  * in `instructions`. The full schema is always in `systemPrefix` (no slicing),
  * so the constraint is just: "Only use these types: profile, article".
  *
+ * CONTEXT BUFFERING
+ * ──────────────────
+ * The live transcript is fed to the AI as three parts (see
+ * AI/classes/AI/TranscriptBuffer.js and AI/classes/AI/Prompt.js):
+ *   1. systemPrefix — fixed, cached, includes rolling-summary instructions.
+ *   2. instructions — includes the "OLDER CONTEXT" block: the structured
+ *      contextSummary the AI returned last call (key_entities,
+ *      topic_timeline, running_narrative).
+ *   3. text — the real-time transcript: the last few overlapping ~200-char
+ *      chunks, trimmed to a token budget via a local tiktoken estimate.
+ * Every response includes an updated contextSummary, which Pipeline.run()
+ * feeds back in as the next call's OLDER CONTEXT — a rolling, structured
+ * summary instead of ever-growing raw transcript text.
+ *
  * @module AI
  */
 const EventEmitter = require('events');
 const Q = require('Q');
-const { buildQueryPrompt, getSchemaCacheKey } = require('./Prompt');
+const { buildQueryPrompt, getSchemaCacheKey, getStaticPrefixTokenCount } = require('./Prompt');
 const AI_LLM                                  = require('./LLM');
+const TranscriptBuffer                        = require('./TranscriptBuffer');
+const PipelineLogger                          = require('./PipelineLogger');
+const WakeMarkers                             = require('./WakeMarkers');
+const TranscriptFold                          = require('./TranscriptFold');
 const Session                                 = require(Q.PLUGINS_DIR + '/Streams/classes/Streams/Transcript/Session');
 var metaphone, _SAFEBOTS_META;
 // ── Intent heuristics ─────────────────────────────────────────────────────────
@@ -47,6 +67,24 @@ const _WAKE_WORDS = _SAFEBOTS_VARIANTS;
 const _WAKE_WORD = 'safebots';
 //const _WAKE_WORD = /\b(?:hey|hi|ok|okay|so|yo)\s+(?:cubix|cubics|cubex|cubick|kubix|kubics|q\s?bix|cube\s?[ex])\b/i;
 const _COMPLETION_MARKER_RE = /\b(thanks|thank you|go ahead|do it|proceed)\b\.?$/ig;
+
+const syl1 = ["safe", "save", "said", "saved", "say", "same", "see", "set", "sill", "so", "sorry", "they", "think", "three"];
+const syl2 = ["about", "thoughts", "box", "bots?", "boats?", "but", "boards?", "bod", "both", "mods", "bob's", "boss?", "what'?s?", "months", "words", "involts", "pause"];
+
+// 2. Single-word misrecognitions (Requires lead-in filler)
+const singleWords = ["sig", "seawboards?", "supports?", "symbols?"];
+
+// 3. Lead-in Fillers
+const requiredHeyLeadIn = "hey\\s+";
+const requiredLeadIn = "(?:hey|hi)\\s+";
+
+// 4. Compiled Regex Construction
+// Removed ^ from the beginning to match anywhere in the transcript string
+const WAKE_WORD_REGEX = new RegExp(
+  `\\b(?:${requiredHeyLeadIn}(?:${syl1.join("|")})\\s+(?:${syl2.join("|")})|${requiredLeadIn}(?:${singleWords.join("|")}))\\b`,
+  "i"
+);
+
 
 function _detectIntent(text, ner) {
     if (_SLIDE_RE.test(text))
@@ -86,7 +124,9 @@ class Pipeline extends EventEmitter {
         const self = this;
         this.Q              = Q;
         this.session        = options.session;
+        this._logger        = new PipelineLogger(this.session);
         this._running       = false;
+        this._entiresQueue  = [];
         this._currentTopic  = null;
         this._onTopicChange = options.onTopicChange || null;
         this._emitToUser    = options.emitToUser    || null;
@@ -121,11 +161,21 @@ class Pipeline extends EventEmitter {
 
 
         this._wakeInterval = setInterval(async function () {
+            // wakeLastUpdate refreshes on every wake-related utterance (see
+            // processUtteranceWithWakeWord) -- this is meant to be a SILENCE
+            // timeout ("no new speech in 3s -> wrap up"), not an absolute cap
+            // on the whole command. Checking wakeStartedAt instead would cut
+            // off any command longer than 3s while the speaker is still
+            // actively talking.
             if (self.session.wakeState === 'listening' &&
-                (Date.now() - self.session.wakeStartedAt) > 5000) {
+                (Date.now() - self.session.wakeLastUpdate) > 3000) {
 
-                const latestWakeEntry = [...self.session.wakeEntires].at(-1);
+                let latestWakeEntry;
 
+                for (const value of self.session.wakeEntires) {
+                    latestWakeEntry = value;
+                }
+                
                 if (!latestWakeEntry.isFinal) return;
 
                 // Timed out — process what we have, or drop it
@@ -137,7 +187,7 @@ class Pipeline extends EventEmitter {
                 var result = await self.run(latestWakeEntry, fullCommand);
                 self.emit('result', { result: result })
             }
-        }, 5000);
+        }, 3000);
     }
 
     /**
@@ -146,11 +196,17 @@ class Pipeline extends EventEmitter {
      * @return {Promise<object|null>}
      */
     async run(entry, wakeResult) {
+        //console.log('LLM: pipeline: run');
+
         if (!entry) return null;
-        if (this._running) return null;
+        if (this._running) {
+            this._entiresQueue.push({args: Array.prototype.slice.call(arguments)});
+            return null;
+        }
         this._running = true;
 
         let text = typeof wakeResult == 'string' ? wakeResult : entry.text;
+        let logFields = null; // populated once we reach the LLM stage; flushed in finally
         try {
             //console.log('LLM: pipeline: wakeResult', typeof wakeResult);
             //console.log('LLM: pipeline: text', text);
@@ -170,7 +226,7 @@ class Pipeline extends EventEmitter {
                 if (wakeRequest === true) {
                     return;
                 } else if (typeof wakeRequest == 'string') {
-                    //console.log('LLM: pipeline: safebots request', wakeRequest);
+                    //console.log('LLM: pipeline: safebots request', entry.wakeUpTextLength, wakeRequest);
                     if (entry.wakeUpTextLength != null) {
                         entry.wakeUpTextLength = entry.wakeUpTextLength + text.length;
                     }
@@ -178,6 +234,7 @@ class Pipeline extends EventEmitter {
                 }
 
                 //console.log('LLM: pipeline: is wake', typeof wakeResult);
+                //console.log('LLM: pipeline: wakeRequest', wakeRequest);
 
             }
 
@@ -203,79 +260,74 @@ class Pipeline extends EventEmitter {
             if (!this._adapter) return null;
 
             //const intent = _detectIntent(text, ner);
-            
+
+            // Chunk window + rolling summary for this session — see
+            // AI/classes/AI/TranscriptBuffer.js. Lazily created since a
+            // session's first utterance can arrive via either path below.
+            if (!this.session.transcriptContext) {
+                this.session.transcriptContext = new TranscriptBuffer();
+            }
+            const transcriptContext = this.session.transcriptContext;
+
             if (!wakeRequest && typeof wakeResult != 'string') { //finished wake request must be sent immediately, if this is regular transcript, send buffer
-                let bufferText = '';
-                let removeWakeRequest = false;
-                let someChunksSent = false;
-                let entiresToRemove = []
-                for (let i in this.session.transcriptBuffer) {
-                    let entry = this.session.transcriptBuffer[i];
-                    bufferText += entry.text;
-                    if(entry.isWakeUp) {
-                        //console.log('LLM: pipeline: entry.isWakeUp');
+                // Pulls out and removes every finalized entry — see
+                // TranscriptFold for why "finalized" is the safe moment to
+                // consume an entry (fixes the duplication bug where entries
+                // used to linger and get re-folded on every subsequent call,
+                // including the many interim calls that share one entry
+                // while its text is still growing).
+                const folded = TranscriptFold.foldFinalized(
+                    this.session.transcriptBuffer,
+                    this.session.transcriptBufferMap
+                );
+                let newText = folded.text;
 
-                        removeWakeRequest = true;
-                    }
-                    if(entry.sentToLLM) {
-                        someChunksSent = true;
-                    }
-                    entiresToRemove.push(entry);
+                // Cut only the wake-request span(s) out of the finalized
+                // text — never the whole entry, since an entry can carry
+                // ordinary speech before __WAKESTART__ or after __WAKEEND__
+                // that still belongs in the general buffer. The wake
+                // request itself was already (or will be) submitted to the
+                // AI separately by the wake pipeline (see onWakeEndWord).
+                if (folded.hasWakeMarkers) {
+                    newText = WakeMarkers.stripSpans(newText);
                 }
 
-                let charactersNum = 200;
-                if(someChunksSent) {
-                    charactersNum = this.session.lastSentTextlength + 100;
-                }
-
-                if (bufferText.length < charactersNum) { //~10-15 seconds
-                    //console.log('LLM: pipeline: buffer is short');
-
-                    return;
-                }
-
-                if(removeWakeRequest) {
-                    bufferText = bufferText.replace(/__WAKESTART__.*?__WAKEEND__/s, "");   
-                }
-                
-                if (bufferText.length < charactersNum) { //~10-15 seconds
-                    //console.log('LLM: pipeline: buffer is short 2');
-
-                    return;
-                }
-                //console.log('LLM: pipeline: entiresToRemove', entiresToRemove.length);
-                //console.log('LLM: pipeline: bufferText', bufferText);
-
-                for (let e in entiresToRemove) {
-                    for (let i = this.session.transcriptBuffer.length - 1; i >= 0; i--) {
-                        if(entiresToRemove[e] == this.session.transcriptBuffer[i]) {
-                            const entry = entiresToRemove[e];
-                            entry.sentToLLM = true;
-                            if(entry.isFinal) {
-                                //this.session.transcriptBuffer.splice(i, 1);
-                                //this.session.transcriptBufferMap.delete(entry.latestFinalAt);
-                            }
-                        }
-                    }
-                }
-
-
+                // Safety net: entries that never finalize (a stuck interim
+                // recognition) would otherwise sit here forever. Trim the
+                // oldest once that backlog gets unreasonable. Consumed
+                // (final) entries are already gone by this point, so this
+                // only ever prunes entries still waiting to finalize.
                 if (this.session.transcriptBuffer.length > 8) {
                     let removed = this.session.transcriptBuffer.splice(0, this.session.transcriptBuffer.length - 8);
-                    for (let e in removed) {
-                        //console.log('LLM: pipeline: remove from buffer', removed[e].latestFinalAt);
-                        this.session.transcriptBufferMap.delete(removed[e].latestFinalAt);
+                    //console.log('LLM: pipeline: remove from buffer', removed.length);
+                    for (const entry of removed) {
+                        this.session.transcriptBufferMap.delete(entry.latestFinalAt);
                     }
                 }
-                
-                text = bufferText;
-            } else {
-                
+
+                if (!newText) return; // nothing newly finalized this call
+
+                transcriptContext.addText(newText);
+
+                // Rule #1: only call the AI once >= 200 new characters have
+                // accumulated since the last chunk was finalized.
+                if (!transcriptContext.hasEnoughNewText()) {
+                    //console.log('LLM: pipeline: buffer is short', transcriptContext.pendingLength(), transcriptContext.chunkSize);
+                    return;
+                }
+                transcriptContext.flushPendingChunk();
+
+                // Real-time transcript = last N overlapping chunks, trimmed
+                // to the token budget (rule #2). text is the raw window;
+                // the rolling summary goes into "instructions" below as the
+                // Older Context block.
+                text = transcriptContext.getRealtimeWindow();
             }
 
             const { systemPrefix, instructions, executeOptions } = buildQueryPrompt({
                 text,
                 entities: ner,
+                contextSummary: transcriptContext.getSummary(),
                 sessionContext: {
                     currentTopic: this._currentTopic,
                     lastVisualization: this._lastVisualizationType || null,
@@ -283,6 +335,16 @@ class Pipeline extends EventEmitter {
                     //hintedType: _detectSuggestedType(text, ner)
                 }
             });
+
+            // Everything sent to the AI this call — flushed to the log in
+            // `finally` below regardless of how this call turns out, so a
+            // parse failure or thrown error still leaves a full record.
+            logFields = {
+                type:                typeof wakeResult == 'string' ? 'SAFEBOT_REQUEST' : 'REGULAR_BUFFER',
+                text,
+                instructions,
+                systemPrefixTokens:  getStaticPrefixTokenCount()
+            };
 
             let raw;
             if (this._canCache) {
@@ -304,17 +366,17 @@ class Pipeline extends EventEmitter {
                 // OpenAI auto-caches any prefix ≥1024 tokens.
                 const fullSystem = systemPrefix + (instructions ? '\n\n' + instructions : '');
                 this.session.lastSentTextlength = text.length;
-                //console.log('LLM: pipeline: sending to LLM', text);
+                console.log('LLM: pipeline: sending to LLM');
 
                 raw = await this._adapter.executeModel(
                     fullSystem,
                     { text },
                     executeOptions
                 );
-                
-                //console.log('LLM: pipeline: LLM raw', raw);
-
             }
+
+            logFields.usage     = raw && raw.usage;
+            logFields.citations = raw && raw.citations;
 
             // Log cache hit/miss for the first few calls during testing
             if (raw && raw.usage) {
@@ -337,7 +399,12 @@ class Pipeline extends EventEmitter {
                 : (raw && raw.toString) ? String(raw)
                 : null;
 
-            if (!rawText) return null;
+            logFields.rawResponse = rawText;
+
+            if (!rawText) {
+                logFields.error = 'empty response from adapter';
+                return null;
+            }
 
                 //console.log('LLM: pipeline: LLM raw 3');
             const cleaned = rawText
@@ -345,6 +412,19 @@ class Pipeline extends EventEmitter {
                 .replace(/\n?```$/i, '')
                 .trim();
             const result = JSON.parse(cleaned);
+            logFields.result = result;
+
+            // Persist the updated rolling summary regardless of "action" —
+            // it's the model's memory of the talk, not a proposal, so it
+            // must survive even on "none" turns. Stripped before returning
+            // below (and before logging `result`, since it's logged as its
+            // own field); it's internal bookkeeping, not part of the client
+            // payload.
+            if (result && result.contextSummary) {
+                logFields.contextSummary = result.contextSummary;
+                transcriptContext.setSummary(result.contextSummary);
+                delete result.contextSummary;
+            }
 
                 //console.log('LLM: pipeline: LLM raw 4');
             if (!result || result.action === 'none' || !result.action) return null;
@@ -397,16 +477,35 @@ class Pipeline extends EventEmitter {
 
                 //console.log('LLM: pipeline: LLM raw 9');
             if(wakeRequest) {
-                result.wakeRequest = 'Safebots, ' + text;
+            result.wakeRequest = text;
             }
             return result;
 
         } catch (e) {
-            //console.log('LLM: pipeline: error', e.message);
+            console.log('LLM: pipeline: error', e.message);
             this.Q.log && this.Q.log('Pipeline LLM error:', e.message);
+            if (logFields) logFields.error = e.message;
             return null;
         } finally {
+            if (logFields) this._logger.logCall(logFields);
             this._running = false;
+            if (this._entiresQueue.length != 0) {
+                let queueItem = this._entiresQueue.splice(0, 1)[0];
+                // No `return` here: a `return` inside `finally` overrides
+                // whatever `try`/`catch` was about to return, which was
+                // silently discarding the LLM result on every call that had
+                // a backlog entry queued up by the time it finished — i.e.
+                // almost every call, since interim WebSpeech results queue
+                // up continuously while a call is in flight.
+                //
+                // The queued run itself is fire-and-forget from here (its
+                // caller already got this call's return value), so forward
+                // its eventual result the same way the wake-interval timeout
+                // path does, or it would be silently dropped too.
+                this.run.apply(this, queueItem.args).then((queuedResult) => {
+                    if (queuedResult) this.emit('result', { result: queuedResult });
+                });
+            }
         }
     }
 
@@ -510,9 +609,21 @@ class Pipeline extends EventEmitter {
     }
 
     detectWakeWord(transcript) {
-        return _WAKE_WORDS.test(transcript)         // Layer 1: exact
+        if(WAKE_WORD_REGEX.test(transcript)) {
+            //console.log('detectWakeWord 1')
+            return true;
+        }
+        if(this.detectWakeWordPhonetic(transcript)) {
+            //console.log('detectWakeWord 2')
+            return true;
+        }
+        if(this.detectWakeWordLevenshtein(transcript)) {
+            //console.log('detectWakeWord 3')
+            return true;
+        }
+        /* return WAKE_WORD_REGEX.test(transcript)         // Layer 1: exact
             || this.detectWakeWordPhonetic(transcript)         // Layer 2: sound-alike
-            || this.detectWakeWordLevenshtein(transcript);     // Layer 3: edit distance
+            || this.detectWakeWordLevenshtein(transcript);     // Layer 3: edit distance */
     }
 
     detectWakeWordPhonetic(transcript) {
@@ -565,15 +676,40 @@ class Pipeline extends EventEmitter {
 
     extractCommandAfterWakeWord(transcript) {
         // Find where the wake word matched — replace variants with a marker, then split
-        const self = this;
-        var marked = transcript
-            .replace(_WAKE_WORDS, '__WAKESTART__')
-            // Fallback: also mark phonetic and Levenshtein matches
-            .replace(/\b\S+\b/g, function (w) {
-                if (metaphone(w) === _SAFEBOTS_META) return '__WAKESTART__';
-                if (self.levenshtein(w, _WAKE_WORD) <= 2) return '__WAKESTART__';
-                return w;
-            });
+        var marked = transcript.replace(WAKE_WORD_REGEX, '__WAKESTART__');
+
+        // Fallback: the exact-pattern regex found nothing, but detectWakeWord() may still
+        // have matched via the phonetic/Levenshtein layers (single word or adjacent pair
+        // joined) — mirror that same logic here so we can mark where it matched.
+        if (marked.indexOf('__WAKESTART__') === -1) {
+            var tokens = marked.split(/(\s+)/); // keep whitespace separators so we can rejoin
+            var wordIndices = [];
+            for (var i = 0; i < tokens.length; i++) {
+                if (!/^\s*$/.test(tokens[i])) wordIndices.push(i);
+            }
+            var matched = false;
+            for (var k = 0; k < wordIndices.length && !matched; k++) {
+                var idx = wordIndices[k];
+                var w = tokens[idx].toLowerCase();
+                if (metaphone(w) === _SAFEBOTS_META || this.levenshtein(w, _WAKE_WORD) <= 2) {
+                    tokens[idx] = '__WAKESTART__';
+                    matched = true;
+                }
+            }
+            if (!matched) {
+                for (var k = 0; k < wordIndices.length - 1 && !matched; k++) {
+                    var idx1 = wordIndices[k], idx2 = wordIndices[k + 1];
+                    var joined = (tokens[idx1] + tokens[idx2]).toLowerCase();
+                    if (metaphone(joined) === _SAFEBOTS_META || this.levenshtein(joined, _WAKE_WORD) <= 2) {
+                        tokens[idx1] = '__WAKESTART__';
+                        for (var j = idx1 + 1; j <= idx2; j++) tokens[j] = '';
+                        matched = true;
+                    }
+                }
+            }
+            marked = tokens.join('');
+        }
+
         var parts = marked.split('__WAKESTART__');
         // Everything after the wake word (and past any leading punctuation/whitespace)
         return {
@@ -612,6 +748,13 @@ class Pipeline extends EventEmitter {
                 transcriptEntry.text = completionCheck.marked;
                 transcriptEntry.isWakeUpEndEntry = true;
                 return this.onWakeEndWord(session);
+            } else {
+                let fullCommand = 'Safebots, ' + this.getFullCommand(this.session).replace(/__WAKESTART__.*?__WAKEEND__/s, "");
+                //console.log('fullCommand', fullCommand)
+                this._logger.logWakeEvent('PENDING_LISTENING', fullCommand);
+                Q.plugins.Users.Socket.emitToUser(this.session.userId, 'Streams/pendingListening', {
+                    requestText: fullCommand
+                });
             }
             // No completion yet, keep accumulating (with timeout — see below)
             return true;  // consumed
@@ -619,7 +762,9 @@ class Pipeline extends EventEmitter {
         // Not listening — check for wake word
         if ((!transcriptEntry.isWakeUp || (transcriptEntry.isWakeUp && transcriptEntry.wakeUpTextLength)) && this.detectWakeWord(transcript)) {
             
-            //console.log('pipeline: started listening');
+            //console.log('pipeline: started listening: ' + transcript);
+            this._logger.logWakeEvent('STARTED_LISTENING', transcript);
+
             session.wakeEntires = new Set();
             if(!session.wakeEntires.has(transcriptEntry)) {
                 session.wakeEntires.add(transcriptEntry);
@@ -640,6 +785,10 @@ class Pipeline extends EventEmitter {
                 transcriptEntry.text = completionCheck.marked;
                 transcriptEntry.isWakeUpEndEntry = true;
                 return this.onWakeEndWord(session);
+            } else {
+                Q.plugins.Users.Socket.emitToUser(this.session.userId, 'Streams/startedListening', {
+                    
+                });
             }
             return true;  // consumed
         }
@@ -647,34 +796,50 @@ class Pipeline extends EventEmitter {
         return false;  // no wake context, process normally
     }
 
+    getFullCommand(session) {
+        // Collect each entry's extracted contribution and join only the
+        // non-empty ones with a single space. Unconditionally prepending a
+        // separator per entry (as this used to) means an entry that
+        // contributes nothing -- e.g. the wake-word entry itself, once
+        // "Hey Safebots" is stripped out -- still adds a bare separator, so
+        // a run of such entries degenerates into pure noise with the real
+        // command text buried or lost entirely.
+        const parts = [];
+        for (let wakeEntry of session.wakeEntires) {
+            //console.log('pipeline: detected end for', wakeEntry.text);
+            let piece;
+            if (wakeEntry.isWakeUpStartEntry && wakeEntry.isWakeUpEndEntry) {
+                const match = wakeEntry.text.match(/__WAKESTART__(.*?)__WAKEEND__/s);
+                piece = match ? match[1] : '';
+            } else if (wakeEntry.isWakeUpStartEntry) {
+                piece = wakeEntry.text.match(/__WAKESTART__(.*)$/s)?.[1] ?? '';
+            } else if (wakeEntry.isWakeUpEndEntry) {
+                piece = wakeEntry.text.match(/^(.*?)__WAKEEND__/s)?.[1] ?? '';
+            } else { //!wakeEntry.isWakeUpStartEntry && !wakeEntry.isWakeUpEndEntry
+                piece = wakeEntry.text;
+            }
+            piece = (piece || '').trim();
+            if (piece) parts.push(piece);
+        }
+        return parts.join(' ');
+    }
+
     onWakeEndWord(session) {
         //console.log('pipeline: detected end', session.wakeEntires.size);
         session.wakeState = null;
 
-        let fullCommand = '';
-        for (let wakeEntry of session.wakeEntires) {
-            //console.log('pipeline: detected end for', wakeEntry);
-            //if(!wakeEntry.text) continue;
-            if (wakeEntry.isWakeUpStartEntry && wakeEntry.isWakeUpEndEntry) {
-                const match = wakeEntry.text.match(/__WAKESTART__(.*?)__WAKEEND__/);
-                fullCommand += match ? match[1].trim() : null;
-            } else if (wakeEntry.isWakeUpStartEntry) {
-                const after = wakeEntry.text.match(/__WAKESTART__(.*)$/s)?.[1] ?? "";
-                fullCommand += after;
-            } else if (wakeEntry.isWakeUpEndEntry) {
-                const before = wakeEntry.text.match(/^(.*?)__WAKEEND__/s)?.[1] ?? "";
-                fullCommand += before;
-            } else { //!wakeEntry.isWakeUpStartEntry && !wakeEntry.isWakeUpEndEntry
-                fullCommand += wakeEntry.text;
-            }
-        }
+        let fullCommand = this.getFullCommand(session);
         //console.log('pipeline: fullCommand', fullCommand);
+        this._logger.logWakeEvent('ENDED_LISTENING', fullCommand);
 
         session.wakeStartedAt = null;
         session.wakeEntires = null;
         session.wakeStartedAt = null;
         session.wakeLastUpdate = null;
-        return fullCommand;
+        Q.plugins.Users.Socket.emitToUser(this.session.userId, 'Streams/endedListening', {
+                    
+        });
+        return 'Safebots, ' + fullCommand;
     }
 
     isCompletionMarker(text) {
