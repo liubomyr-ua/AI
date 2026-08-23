@@ -437,6 +437,45 @@
 			"whoEmits": "CommandsClassifier"
 		}
 	},
+	"contextSummary": {
+		"_comment": "Rolling summary of everything that has scrolled out of the real-time transcript window. Returned in EVERY response (see the outer response schema's 'contextSummary' field) so the AI plugin can feed back a compact 'OLDER CONTEXT' block next call instead of the full transcript history. Structured on purpose — forcing the model to re-populate discrete fields (rather than freely rewriting prose) avoids 'telephonic decay' from repeated re-summarization. See AI/classes/AI/TranscriptBuffer.js and AI/classes/AI/Prompt.js#renderOlderContext.",
+		"instructions": "Merge the OLDER CONTEXT you were given with new information from the REAL-TIME TRANSCRIPT below it. Carry forward everything still true unchanged; update only what the transcript explicitly changed or added.",
+		"maxKeyEntities": 8,
+		"maxTopicTimelineEntries": 12,
+		"maxRunningNarrativeWords": 250,
+		"fields": {
+			"key_entities": {
+				"type": "array",
+				"items": "string",
+				"required": true,
+				"description": "Immutable hard facts: names, metrics, technologies, key terms. One short string per entity, e.g. 'Performance metric: Latency 180ms -> 22ms'. Carry each entry forward UNCHANGED every cycle unless the transcript explicitly supersedes it — then rewrite as 'Label: old -> new'. Never drop an entity just because it stopped being discussed; only remove it if the speaker explicitly retracts it."
+			},
+			"topic_timeline": {
+				"type": "array",
+				"items": "string",
+				"required": true,
+				"description": "Mini-log of high-level topics, oldest first, formatted 'HH:MM - topic' using relSec-derived elapsed time. Append a new entry when the topic shifts; never rewrite or remove earlier entries. Mark the most recent (current) entry with a trailing ' [CURRENT]' and strip that suffix from whichever entry had it before."
+			},
+			"running_narrative": {
+				"type": "string",
+				"required": true,
+				"description": "Third-person prose summary of the talk's arc so far, under 250 words. Rewrite each cycle to fold in new developments while preserving continuity with the previous narrative — this is the one field allowed to be reworded, not just appended to."
+			}
+		},
+		"example": {
+			"key_entities": [
+				"Tech stack: PHP -> Go gRPC",
+				"Performance metric: Latency 180ms -> 22ms",
+				"Model used: Llama 3.1 8B on CPU"
+			],
+			"topic_timeline": [
+				"00:00 - Introduction to real-time streaming issues",
+				"02:15 - Backend optimization (Go migration)",
+				"08:30 - Designing the context buffer algorithm [CURRENT]"
+			],
+			"running_narrative": "The speaker outlined why PHP was hitting latency walls during live broadcasts and explained how a Go gRPC service brought latency down to 22ms. Currently demonstrating how the context buffer handles token caps."
+		}
+	},
 	"visualizationTypes": {
 		"_comment": "When the LLM proposes a visualization, it returns one of these types plus the fields below. The AI plugin maps these to Qbix stream types and creates the stream.",
 		"stat": {
