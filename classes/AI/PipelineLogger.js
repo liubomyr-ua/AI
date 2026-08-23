@@ -18,9 +18,9 @@
  * @class PipelineLogger
  */
 
-var appendFile = require('node:fs/promises').appendFile;
-var mkdir      = require('node:fs/promises').mkdir;
-var dirname    = require('node:path').dirname;
+var appendFile = require('fs/promises').appendFile;
+var mkdir      = require('fs/promises').mkdir;
+var dirname    = require('path').dirname;
 var Q          = require('Q');
 
 /**
