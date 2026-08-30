@@ -75,13 +75,65 @@ const syl2 = ["about", "thoughts", "box", "bots?", "boats?", "but", "boards?", "
 const singleWords = ["sig", "seawboards?", "supports?", "symbols?"];
 
 // 3. Lead-in Fillers
+const optionalHeyLeadIn = "(?:hey\\s+)?";
 const requiredHeyLeadIn = "hey\\s+";
 const requiredLeadIn = "(?:hey|hi)\\s+";
 
-// 4. Compiled Regex Construction
-// Removed ^ from the beginning to match anywhere in the transcript string
+// 4. Request / imperative phrases that let a BARE "Safebots" (no "hey"/"hi")
+// open the mic on its own: politeness markers, modal requests, desire
+// statements, imperative action verbs, and question formulations. Without
+// one of these immediately after it, an unprefixed mention of the name
+// mid-conversation is just narration ("...the safebots project...") rather
+// than a command, and must NOT open the mic.
+const REQUEST_PHRASES = [
+    // politeness markers
+    "please", "kindly", "if you (?:could|would|can)",
+    // modal requests
+    "can you", "could you", "would you", "will you", "won'?t you",
+    // desire / intent statements
+    "i want you to", "i need you to", "i'?d like you to",
+    "i would like you to", "i'?m asking you to",
+    // imperative action verbs directed at the assistant
+    "show me", "tell me", "give me", "pull up", "bring up", "display",
+    "explain", "walk me through", "help me (?:understand|with)", "find me",
+    "look up", "search for", "get me", "put together", "create", "make",
+    "generate", "build", "draw", "plot", "chart", "compare", "define",
+    "summarize", "list",
+    // question formulations
+    "what'?s", "what is", "what are", "how many", "how much", "how do(?:es)?",
+    "why is", "why are", "when did", "where is", "who is", "who was",
+    "do you know",
+    // directive lead-ins
+    "go ahead and", "let'?s", "now show", "now tell", "i have a question"
+];
+const _REQUEST_PHRASE_RE_SOURCE = `(?:${REQUEST_PHRASES.join("|")})`;
+const _REQUEST_PHRASE_START_RE  = new RegExp(`^${_REQUEST_PHRASE_RE_SOURCE}\\b`, "i");
+
+// 5. Compiled Regex Construction
+// Removed ^ from the beginning to match anywhere in the transcript string.
+//
+// WAKE_WORD_REGEX matches the wake word with an OPTIONAL "hey" lead-in --
+// used only to find/mark where it occurred (extractCommandAfterWakeWord),
+// not to decide whether to start listening. That decision is split into
+// two separate rules, checked in detectWakeWord():
+//   - WAKE_WORD_HEY_REGEX: "hey/hi Safebots" -- always opens the mic.
+//   - WAKE_WORD_BARE_REQUEST_REGEX: bare "Safebots" with no lead-in --
+//     opens the mic only when immediately followed by a request phrase
+//     (see REQUEST_PHRASES above). Single-word misrecognitions are
+//     excluded from this rule; they already require a "hey/hi" lead-in to
+//     be trusted at all.
 const WAKE_WORD_REGEX = new RegExp(
+  `\\b(?:${optionalHeyLeadIn}(?:${syl1.join("|")})\\s+(?:${syl2.join("|")})|${requiredLeadIn}(?:${singleWords.join("|")}))\\b`,
+  "i"
+);
+
+const WAKE_WORD_HEY_REGEX = new RegExp(
   `\\b(?:${requiredHeyLeadIn}(?:${syl1.join("|")})\\s+(?:${syl2.join("|")})|${requiredLeadIn}(?:${singleWords.join("|")}))\\b`,
+  "i"
+);
+
+const WAKE_WORD_BARE_REQUEST_REGEX = new RegExp(
+  `\\b(?:${syl1.join("|")})\\s+(?:${syl2.join("|")})\\b[\\s,.:;!—-]*${_REQUEST_PHRASE_RE_SOURCE}\\b`,
   "i"
 );
 
@@ -608,9 +660,24 @@ class Pipeline extends EventEmitter {
         });
     }
 
+    /**
+     * Two ways a transcript can open the mic:
+     *   1. "Hey/Hi Safebots" (exact or a fuzzy/phonetic near-miss) --
+     *      always triggers, whatever follows.
+     *   2. Bare "Safebots" with no "hey/hi" lead-in -- triggers only when
+     *      immediately followed by a request/imperative phrase (see
+     *      REQUEST_PHRASES), so an incidental mention of the name doesn't
+     *      hijack listening.
+     * Layers 2/3 (phonetic, Levenshtein) apply this same rule per candidate
+     * match via _wakeWordContextOk().
+     */
     detectWakeWord(transcript) {
-        if(WAKE_WORD_REGEX.test(transcript)) {
-            //console.log('detectWakeWord 1')
+        if(WAKE_WORD_HEY_REGEX.test(transcript)) {
+            //console.log('detectWakeWord 1: hey + wake word')
+            return true;
+        }
+        if(WAKE_WORD_BARE_REQUEST_REGEX.test(transcript)) {
+            //console.log('detectWakeWord 1b: bare wake word + request phrase')
             return true;
         }
         if(this.detectWakeWordPhonetic(transcript)) {
@@ -621,21 +688,34 @@ class Pipeline extends EventEmitter {
             //console.log('detectWakeWord 3')
             return true;
         }
-        /* return WAKE_WORD_REGEX.test(transcript)         // Layer 1: exact
-            || this.detectWakeWordPhonetic(transcript)         // Layer 2: sound-alike
-            || this.detectWakeWordLevenshtein(transcript);     // Layer 3: edit distance */
+        return false;
+    }
+
+    /**
+     * Gate for a fuzzy (phonetic/Levenshtein) wake-word candidate spanning
+     * words[startIdx..endIdx]: allow it either because "hey"/"hi"
+     * immediately precedes it, or -- with no such lead-in -- because a
+     * request/imperative phrase immediately follows it. Mirrors the
+     * WAKE_WORD_HEY_REGEX / WAKE_WORD_BARE_REQUEST_REGEX split above, for
+     * candidates the exact regexes didn't catch.
+     */
+    _wakeWordContextOk(words, startIdx, endIdx) {
+        var before = startIdx > 0 ? words[startIdx - 1].replace(/[^a-z]/gi, '') : '';
+        if (/^(?:hey|hi)$/i.test(before)) return true;
+        var window = words.slice(endIdx + 1, endIdx + 7).join(' ');
+        return _REQUEST_PHRASE_START_RE.test(window);
     }
 
     detectWakeWordPhonetic(transcript) {
         var words = transcript.toLowerCase().split(/\s+/);
         // Try each word alone
         for (var i = 0; i < words.length; i++) {
-            if (metaphone(words[i]) === _SAFEBOTS_META) return true;
+            if (metaphone(words[i]) === _SAFEBOTS_META && this._wakeWordContextOk(words, i, i)) return true;
         }
         // Try adjacent word pairs (for "safe bots", "save box", etc.)
         for (var i = 0; i < words.length - 1; i++) {
             var joined = words[i] + words[i + 1];
-            if (metaphone(joined) === _SAFEBOTS_META) return true;
+            if (metaphone(joined) === _SAFEBOTS_META && this._wakeWordContextOk(words, i, i + 1)) return true;
         }
         return false;
     }
@@ -664,12 +744,12 @@ class Pipeline extends EventEmitter {
         var words = transcript.toLowerCase().split(/\s+/);
         // Try each word — allow up to 2 edits
         for (var i = 0; i < words.length; i++) {
-            if (this.levenshtein(words[i], target) <= 2) return true;
+            if (this.levenshtein(words[i], target) <= 2 && this._wakeWordContextOk(words, i, i)) return true;
         }
         // Try adjacent pairs joined
         for (var i = 0; i < words.length - 1; i++) {
             var joined = words[i] + words[i + 1];
-            if (this.levenshtein(joined, target) <= 2) return true;
+            if (this.levenshtein(joined, target) <= 2 && this._wakeWordContextOk(words, i, i + 1)) return true;
         }
         return false;
     }
