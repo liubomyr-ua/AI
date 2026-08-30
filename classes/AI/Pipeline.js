@@ -224,7 +224,7 @@ class Pipeline extends EventEmitter {
 
                 let latestWakeEntry;
 
-                for (const value of self.session.wakeEntires) {
+                for (const value of self.session.wakeEntries) {
                     latestWakeEntry = value;
                 }
                 
@@ -805,8 +805,8 @@ class Pipeline extends EventEmitter {
         // Are we already listening for a follow-up?
         if (session.wakeState === 'listening') {
             //console.log('pipeline: listening');
-            if(!session.wakeEntires.has(transcriptEntry)) {
-                session.wakeEntires.add(transcriptEntry);
+            if(!session.wakeEntries.has(transcriptEntry)) {
+                session.wakeEntries.add(transcriptEntry);
                 transcriptEntry.isWakeUp = true;
             }
 
@@ -845,9 +845,9 @@ class Pipeline extends EventEmitter {
             //console.log('pipeline: started listening: ' + transcript);
             this._logger.logWakeEvent('STARTED_LISTENING', transcript);
 
-            session.wakeEntires = new Set();
-            if(!session.wakeEntires.has(transcriptEntry)) {
-                session.wakeEntires.add(transcriptEntry);
+            session.wakeEntries = new Set();
+            if(!session.wakeEntries.has(transcriptEntry)) {
+                session.wakeEntries.add(transcriptEntry);
             }
             transcriptEntry.isWakeUp = true;
             transcriptEntry.isWakeUpStartEntry = true;
@@ -885,7 +885,7 @@ class Pipeline extends EventEmitter {
         // a run of such entries degenerates into pure noise with the real
         // command text buried or lost entirely.
         const parts = [];
-        for (let wakeEntry of session.wakeEntires) {
+        for (let wakeEntry of session.wakeEntries) {
             //console.log('pipeline: detected end for', wakeEntry.text);
             let piece;
             if (wakeEntry.isWakeUpStartEntry && wakeEntry.isWakeUpEndEntry) {
@@ -905,7 +905,7 @@ class Pipeline extends EventEmitter {
     }
 
     onWakeEndWord(session) {
-        //console.log('pipeline: detected end', session.wakeEntires.size);
+        //console.log('pipeline: detected end', session.wakeEntries.size);
         session.wakeState = null;
 
         let fullCommand = this.getFullCommand(session);
@@ -913,7 +913,7 @@ class Pipeline extends EventEmitter {
         this._logger.logWakeEvent('ENDED_LISTENING', fullCommand);
 
         session.wakeStartedAt = null;
-        session.wakeEntires = null;
+        session.wakeEntries = null;
         session.wakeStartedAt = null;
         session.wakeLastUpdate = null;
         Q.plugins.Users.Socket.emitToUser(this.session.userId, 'Streams/endedListening', {
