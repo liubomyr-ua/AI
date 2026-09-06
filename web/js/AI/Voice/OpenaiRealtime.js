@@ -41,9 +41,13 @@
  */
 (function (root, factory) {
 	if (typeof module === 'object' && module.exports) {
-		module.exports = factory(require('./Voice'));
+		module.exports = factory(require('../Voice'));
 	} else {
-		factory(root.AI.Voice);
+		var impl = factory(root.AI.Voice);
+		root.AI.OpenaiRealtime = impl;
+		if (typeof Q !== 'undefined' && Q.exports) {
+			Q.exports(impl);
+		}
 	}
 }(typeof self !== 'undefined' ? self : this, function (Voice) {
 	'use strict';
@@ -161,6 +165,29 @@
 				// Don't append to DOM — the audio plays via the track.
 			};
 
+			// If startMicrophone() already ran (the supported pre-warming
+			// flow -- see AI.RealtimeSafebots), add its track now so the
+			// initial SDP offer includes the audio m-line. OpenAI's WebRTC
+			// exchange is a single one-shot POST with no renegotiation
+			// endpoint, so a track added AFTER this offer/answer would never
+			// reach the server -- gate with setMicEnabled() instead of
+			// adding a track later.
+			//
+			// Plain addTrack (sendrecv), not a sendonly transceiver: an
+			// earlier attempt to skip negotiating a receive path this way
+			// resulted in OpenAI's server never actually buffering any of
+			// the sent audio (input_audio_buffer.commit failed with
+			// "0.00ms of audio" regardless of how long the mic was
+			// unmuted) -- this endpoint doesn't seem to handle a
+			// sendonly-offered audio m-line correctly. "No audio reply
+			// wanted" is already handled correctly at the session level
+			// (output_modalities:['text'], no audio.output block at all --
+			// see AI_Voice_Openai::createSession()); a sendrecv m-line that
+			// the model just never sends anything on is harmless.
+			if (self._stream) {
+				self._stream.getTracks().forEach(function (t) { pc.addTrack(t, self._stream); });
+			}
+
 			// Data channel for events.
 			var dc = pc.createDataChannel('oai-events');
 			self._dc = dc;
@@ -208,19 +235,56 @@
 
 	// ─── Microphone capture ──────────────────────────────────────────
 
-	OpenaiRealtime.prototype.startMicrophone = function (constraints) {
+	/**
+	 * @param {Object|MediaStreamTrack} input  Either getUserMedia()
+	 *   constraints (default), or an existing MediaStreamTrack to use
+	 *   directly -- e.g. Media/presentation/commands.js's
+	 *   tool.state.audioTrack, so speech recognition and the Realtime
+	 *   session both draw from the same audio source instead of opening a
+	 *   second, independent microphone capture.
+	 */
+	OpenaiRealtime.prototype.startMicrophone = function (input) {
 		var self = this;
+
+		if (typeof MediaStreamTrack !== 'undefined' && input instanceof MediaStreamTrack) {
+			// Clone it: setMicEnabled() gates OUR clone's .enabled flag, not
+			// the original track's. Muting the original would also silence
+			// it for every other consumer -- including the always-on speech
+			// recognition WakeWord.js depends on to detect the wake word in
+			// the first place. clone() shares the same underlying capture
+			// device/source but has an independent enabled/stop lifecycle.
+			var track  = input.clone();
+			var stream = new MediaStream([track]);
+			self._stream = stream;
+			if (self.transport === 'webrtc') {
+				if (self._pc) {
+					self._pc.addTrack(track, stream);
+				}
+				// else: _connectWebRtc() will add it before creating the offer.
+			} else {
+				self._streamPcmOverWs(stream);
+			}
+			return Promise.resolve();
+		}
+
+		var constraints = input;
 		if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
 			return Promise.reject(new Error('AI.Voice: navigator.mediaDevices unavailable'));
 		}
 		return navigator.mediaDevices.getUserMedia(constraints).then(function (stream) {
 			self._stream = stream;
 			if (self.transport === 'webrtc') {
-				// Add track to peer connection.
-				stream.getTracks().forEach(function (t) { self._pc.addTrack(t, stream); });
-				// May need to renegotiate; on most providers the initial
-				// offer was sendonly and adding tracks needs setLocalDescription again.
-				// Skipping renegotiation here; most browsers handle implicitly.
+				if (self._pc) {
+					// Called after connect() -- best-effort only. This
+					// requires renegotiation that OpenAI's one-shot SDP
+					// exchange doesn't support, so the track likely won't
+					// actually reach the server. Prefer calling
+					// startMicrophone() BEFORE connect(): _connectWebRtc()
+					// picks up self._stream and adds it to the initial offer.
+					stream.getTracks().forEach(function (t) { self._pc.addTrack(t, stream); });
+				}
+				// else: _connectWebRtc() will add these tracks itself, right
+				// before creating the initial offer.
 			} else {
 				self._streamPcmOverWs(stream);
 			}
@@ -259,6 +323,26 @@
 		};
 	};
 
+	/**
+	 * Mute/unmute the already-added mic track in place -- no renegotiation,
+	 * just gates whether real audio (vs. silence) actually reaches the
+	 * model. This is how AI.RealtimeSafebots turns streaming on/off in sync
+	 * with wake-word start/end without touching the peer connection itself.
+	 */
+	OpenaiRealtime.prototype.setMicEnabled = function (enabled) {
+		if (!this._stream) return;
+		this._stream.getAudioTracks().forEach(function (t) { t.enabled = !!enabled; });
+	};
+
+	/**
+	 * Manually commit the input audio buffer. Required in manual/push-to-talk
+	 * mode (session configured with turn_detection:null) before requesting a
+	 * response -- with server VAD this happens automatically instead.
+	 */
+	OpenaiRealtime.prototype.commitAudio = function () {
+		this._send({ type: 'input_audio_buffer.commit' });
+	};
+
 	OpenaiRealtime.prototype.stopMicrophone = function () {
 		if (this._stream) {
 			this._stream.getTracks().forEach(function (t) { t.stop(); });
@@ -288,6 +372,26 @@
 	};
 
 	OpenaiRealtime.prototype.respondToToolCall = function (callId, result) {
+		this.sendFunctionCallOutput(callId, result);
+		// After tool output, ask for a response -- this is the right default
+		// for a normal assistant flow (tool call -> speak the result back),
+		// but a caller whose flow ends AT the tool call (a single-shot
+		// "answer via function call" pattern with nothing further to say)
+		// should use sendFunctionCallOutput() directly instead: chaining
+		// another response.create() here would make the model call the
+		// function again, whose acknowledgment would trigger yet another
+		// response.create(), and so on.
+		this._send({ type: 'response.create' });
+	};
+
+	/**
+	 * Send a function call's output without automatically continuing the
+	 * conversation. Use this instead of respondToToolCall() when nothing
+	 * further should be said after the tool call -- e.g. AI.RealtimeSafebots,
+	 * where report_visualization's arguments ARE the answer and chaining a
+	 * response.create() would just make the model call it again.
+	 */
+	OpenaiRealtime.prototype.sendFunctionCallOutput = function (callId, result) {
 		this._send({
 			type: 'conversation.item.create',
 			item: {
@@ -296,8 +400,6 @@
 				output:  typeof result === 'string' ? result : JSON.stringify(result)
 			}
 		});
-		// After tool output, ask for a response.
-		this._send({ type: 'response.create' });
 	};
 
 	OpenaiRealtime.prototype.createResponse = function (options) {
@@ -342,6 +444,10 @@
 		}
 		if (t === 'error') {
 			this.emit('error', new Error(msg.error && msg.error.message || 'unknown error'));
+			return;
+		}
+		if (t === 'response.done') {
+			this.emit('responseDone', msg.response);
 			return;
 		}
 

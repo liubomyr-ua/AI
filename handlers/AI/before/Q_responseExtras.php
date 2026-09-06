@@ -20,6 +20,11 @@
  * a Deepgram API key is configured under AI/deepgram/key, the speech
  * provider is treated as 'deepgram'. This mirrors the server-side
  * convention in AI.js _openTranscription.
+ *
+ * Also injects AI/voice/wakeRequestApproach ('text-pipeline' | 'realtime-api'),
+ * which -- when set -- overrides Media/presentation/commands.js's own
+ * state.wakeRequestApproach tool option, letting a deployment force one
+ * approach for everyone without editing the tool's call sites.
  */
 function AI_before_Q_responseExtras()
 {
@@ -34,5 +39,9 @@ function AI_before_Q_responseExtras()
         'provider'   => $provider,
         'sampleRate' => Q_Config::get('AI', 'speech', 'sampleRate', 16000),
         'chunkMs'    => Q_Config::get('AI', 'speech', 'chunkMs',    100),
+    ));
+
+    Q_Response::setScriptData('Q.plugins.AI.voice', array(
+        'wakeRequestApproach' => Q_Config::get('AI', 'voice', 'wakeRequestApproach', null),
     ));
 }

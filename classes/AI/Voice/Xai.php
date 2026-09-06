@@ -33,7 +33,7 @@ class AI_Voice_Xai extends AI_Voice
 			: Q_Config::expect('AI', 'xai', 'apiKey');
 		$this->baseUrl = rtrim(isset($options['baseUrl'])
 			? $options['baseUrl']
-			: Q_Config::get(array('AI', 'xai', 'baseUrl'), 'https://api.x.ai'), '/');
+			: Q_Config::get('AI', 'xai', 'baseUrl', 'https://api.x.ai'), '/');
 		$this->defaults = $options;
 	}
 
@@ -62,17 +62,20 @@ class AI_Voice_Xai extends AI_Voice
 			$session['output_audio_sample_rate'] = $cfg['sampleRate'];
 		}
 
+		// Q_Utils::post($url, $data, $user_agent, $curl_opts, $header, $timeout, ...)
+		// -- $curl_opts keys must be real CURLOPT_* constants (merged
+		// straight into curl_setopt_array()); headers/timeout have their own
+		// dedicated params instead.
 		$response = Q_Utils::post(
 			$this->baseUrl . '/v1/realtime/client_secrets',
 			array('session' => $session),
 			null,
+			array(),
 			array(
-				'CURLOPT_HTTPHEADER' => array(
-					'Content-Type: application/json',
-					'Authorization: Bearer ' . $this->apiKey
-				),
-				'CURLOPT_TIMEOUT' => 15
-			)
+				'Content-Type: application/json',
+				'Authorization: Bearer ' . $this->apiKey
+			),
+			15
 		);
 
 		if (!$response) {
@@ -107,7 +110,9 @@ class AI_Voice_Xai extends AI_Voice
 			'expiresAt' => $expiresAt,
 			'mode'      => 'direct',
 			'tokenSubprotocol' => 'xai-client-secret',  // browser WS subprotocol prefix
-			'session'   => isset($decoded['session']) ? $decoded['session'] : $session
+			// Always our own constructed $session, never $decoded['session']
+			// -- see AI_Voice_Openai::createSession() for the full rationale.
+			'session'   => $session
 		);
 	}
 }

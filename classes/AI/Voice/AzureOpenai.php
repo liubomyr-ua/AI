@@ -35,16 +35,16 @@ class AI_Voice_AzureOpenai extends AI_Voice
 			: Q_Config::expect('AI', 'azureOpenai', 'endpoint'), '/');
 		$this->apiKey = isset($options['apiKey'])
 			? $options['apiKey']
-			: Q_Config::get(array('AI', 'azureOpenai', 'apiKey'), null);
+			: Q_Config::get('AI', 'azureOpenai', 'apiKey', null);
 		$this->entraToken = isset($options['entraToken'])
 			? $options['entraToken']
-			: Q_Config::get(array('AI', 'azureOpenai', 'entraToken'), null);
+			: Q_Config::get('AI', 'azureOpenai', 'entraToken', null);
 		if (!$this->apiKey && !$this->entraToken) {
 			throw new Exception('AI_Voice_AzureOpenai: apiKey or entraToken required');
 		}
 		$this->apiVersion = isset($options['apiVersion'])
 			? $options['apiVersion']
-			: Q_Config::get(array('AI', 'azureOpenai', 'apiVersion'), '2024-10-01-preview');
+			: Q_Config::get('AI', 'azureOpenai', 'apiVersion', '2024-10-01-preview');
 		$this->defaults = $options;
 	}
 
@@ -56,18 +56,59 @@ class AI_Voice_AzureOpenai extends AI_Voice
 		$deployment = Q::ifset($cfg, 'deployment',
 			Q_Config::expect('AI', 'azureOpenai', 'deployment'));
 
+		// Wire shape per the current OpenAI Realtime API (same as
+		// AI_Voice_Openai -- see its createSession() for the full rationale):
+		// audio settings nest under audio.input / audio.output, "modalities"
+		// is "output_modalities", and format is {type, rate} not a flat
+		// shorthand string.
 		$session = array(
 			'type'  => 'realtime',
 			'model' => $deployment
 		);
-		if (isset($cfg['voice']))          $session['voice']          = $cfg['voice'];
-		if (isset($cfg['instructions']))   $session['instructions']   = $cfg['instructions'];
-		if (isset($cfg['turn_detection'])) $session['turn_detection'] = $cfg['turn_detection'];
-		if (isset($cfg['tools']))          $session['tools']          = $cfg['tools'];
+		if (isset($cfg['instructions']))   $session['instructions']      = $cfg['instructions'];
+		if (isset($cfg['tools']))          $session['tools']             = $cfg['tools'];
+		if (isset($cfg['tool_choice']))    $session['tool_choice']       = $cfg['tool_choice'];
+		if (isset($cfg['modalities']))     $session['output_modalities'] = $cfg['modalities'];
+
+		// Session tracing -- see AI_Voice_Openai::createSession() for the
+		// full rationale. Defaults on via AI/azureOpenai/realTime/tracing config.
+		$tracing = array_key_exists('tracing', $cfg)
+			? $cfg['tracing']
+			: Q_Config::get('AI', 'azureOpenai', 'realTime', 'tracing', true);
+		if ($tracing === true) {
+			$session['tracing'] = 'auto';
+		} elseif ($tracing === false) {
+			$session['tracing'] = null;
+		} else {
+			$session['tracing'] = $tracing;
+		}
 
 		$audioFormat = Q::ifset($cfg, 'audioFormat', 'pcm16');
-		$session['input_audio_format']  = $audioFormat;
-		$session['output_audio_format'] = $audioFormat;
+		$sampleRate  = Q::ifset($cfg, 'sampleRate', 24000);
+		$inputFormat  = is_array($audioFormat) ? $audioFormat : array('type' => 'audio/pcm', 'rate' => $sampleRate);
+		// Output requires "rate" too -- the API rejects output.format
+		// without one, even though the docs' own example omits it.
+		$outputFormat = is_array($audioFormat) ? $audioFormat : array('type' => 'audio/pcm', 'rate' => $sampleRate);
+
+		$audioInput = array('format' => $inputFormat);
+		// array_key_exists, not isset -- turn_detection:null is meaningful
+		// (disables VAD for manual/push-to-talk turn control).
+		if (array_key_exists('turn_detection', $cfg)) $audioInput['turn_detection'] = $cfg['turn_detection'];
+		if (isset($cfg['input_audio_transcription']))  $audioInput['transcription']  = $cfg['input_audio_transcription'];
+
+		$audio = array('input' => $audioInput);
+
+		// Skip audio.output entirely when the caller only wants text back --
+		// see AI_Voice_Openai::createSession() for the full rationale.
+		$modalities = isset($cfg['modalities']) ? (array)$cfg['modalities'] : null;
+		$wantsAudioOut = !$modalities || in_array('audio', $modalities);
+		if ($wantsAudioOut) {
+			$audioOutput = array('format' => $outputFormat);
+			if (isset($cfg['voice'])) $audioOutput['voice'] = $cfg['voice'];
+			$audio['output'] = $audioOutput;
+		}
+
+		$session['audio'] = $audio;
 
 		$headers = array('Content-Type: application/json');
 		if ($this->apiKey) {
@@ -79,10 +120,11 @@ class AI_Voice_AzureOpenai extends AI_Voice
 		$url = $this->endpoint . '/openai/v1/realtime/client_secrets?api-version='
 			. urlencode($this->apiVersion);
 
-		$response = Q_Utils::post($url, array('session' => $session), null, array(
-			'CURLOPT_HTTPHEADER' => $headers,
-			'CURLOPT_TIMEOUT'    => 15
-		));
+		// Q_Utils::post($url, $data, $user_agent, $curl_opts, $header, $timeout, ...)
+		// -- $curl_opts keys must be real CURLOPT_* constants (merged
+		// straight into curl_setopt_array()); headers/timeout have their own
+		// dedicated params instead.
+		$response = Q_Utils::post($url, array('session' => $session), null, array(), $headers, 15);
 		if (!$response) {
 			throw new Exception('AI_Voice_AzureOpenai: empty response');
 		}
@@ -117,7 +159,9 @@ class AI_Voice_AzureOpenai extends AI_Voice
 			'model'     => $deployment,
 			'expiresAt' => $expiresAt,
 			'mode'      => 'direct',
-			'session'   => isset($decoded['session']) ? $decoded['session'] : $session
+			// Always our own constructed $session, never $decoded['session']
+			// -- see AI_Voice_Openai::createSession() for the full rationale.
+			'session'   => $session
 		);
 	}
 }

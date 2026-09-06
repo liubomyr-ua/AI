@@ -518,7 +518,22 @@ function _buildInstructions(options) {
 
     var lines = [
         'Role: ' + role + '. Stream: publisherId="' + publisherId +
-            '", streamName="' + streamName + '".'
+            '", streamName="' + streamName + '".',
+        // Freshly computed every call (this lives in the per-call
+        // instructions block, not the cached static prefix, so this never
+        // goes stale mid-talk) -- without an explicit date, the model has no
+        // way to know its training data might already be outdated for a
+        // fast-changing fact, and will confidently answer from memory even
+        // with web search available.
+        'Today\'s date is ' + new Date().toISOString().slice(0, 10) + '.',
+        'For any fact that can change over time (who currently holds a role, ' +
+            'current events, prices, statistics, etc.), do not trust what you ' +
+            'already believe -- it may predate today. When using web search for ' +
+            'such a question, search for the ROLE or TOPIC itself (e.g. "current ' +
+            'prime minister of Ukraine"), not a specific name you already have in ' +
+            'mind -- searching for a name you expect to confirm tends to surface ' +
+            'that person\'s own page even after they\'ve left the role. Prefer the ' +
+            'most recently updated/dated source you find.'
     ];
 
     if (options.allow && options.allow !== 'any') {

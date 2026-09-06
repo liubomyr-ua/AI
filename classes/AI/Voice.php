@@ -107,9 +107,9 @@ abstract class AI_Voice implements AI_Voice_Interface
 	 */
 	public static function route($routeName, array $options = array())
 	{
-		$routes    = Q_Config::get(array('AI', 'voice', 'routes'),    array());
-		$providers = Q_Config::get(array('AI', 'voice', 'providers'), array());
-		$default   = Q_Config::get(array('AI', 'voice', 'default'),   null);
+		$routes    = Q_Config::get('AI', 'voice', 'routes', array());
+		$providers = Q_Config::get('AI', 'voice', 'providers', array());
+		$default   = Q_Config::get('AI', 'voice', 'default', null);
 
 		$providerName = null;
 		if (is_array($routes) && isset($routes[$routeName])) {
@@ -140,13 +140,13 @@ abstract class AI_Voice implements AI_Voice_Interface
 
 	public static function listRoutes()
 	{
-		$routes = Q_Config::get(array('AI', 'voice', 'routes'), array());
+		$routes = Q_Config::get('AI', 'voice', 'routes', array());
 		return is_array($routes) ? array_keys($routes) : array();
 	}
 
 	public static function listProviders()
 	{
-		$providers = Q_Config::get(array('AI', 'voice', 'providers'), array());
+		$providers = Q_Config::get('AI', 'voice', 'providers', array());
 		return is_array($providers) ? array_keys($providers) : array();
 	}
 }
