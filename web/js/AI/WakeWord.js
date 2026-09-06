@@ -95,7 +95,7 @@
 	var _COMPLETION_MARKER_RE = /\b(thanks|thank you|go ahead|do it|proceed)\b\.?$/ig;
 
 	var syl1 = ["safe", "save", "said", "saved", "say", "same", "see", "set", "sill", "so", "sorry", "they", "think", "three"];
-	var syl2 = ["about", "thoughts", "box", "bots?", "boats?", "but", "boards?", "bod", "both", "mods", "bob's", "boss?", "what'?s?", "months", "words", "involts", "pause"];
+	var syl2 = ["about", "thoughts", "box", "bots?", "boats?", "but", "boards?", "bod", "both", "mods", "bob's", "boss?", "what'?s?", "months", "words", "involts", "pause", "spots"];
 
 	// Single-word misrecognitions (requires a "hey/hi" lead-in filler).
 	var singleWords = ["sig", "seawboards?", "supports?", "symbols?"];
