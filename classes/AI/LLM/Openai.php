@@ -129,15 +129,49 @@ class AI_LLM_Openai extends AI_LLM implements AI_LLM_Interface
 			);
 		}
 
+		// OpenAI's reasoning-model family: o1/o3/o4-series, and gpt-5 as of
+		// its launch.
+		$isReasoningModel = (bool) preg_match('/^(o[1-9](-|$)|gpt-5)/', $model);
+
+		$maxOutputTokens = Q::ifset($options, 'max_tokens', 3000);
+		if ($isReasoningModel && !isset($options['max_tokens'])) {
+			// Reasoning models spend part of max_output_tokens on hidden
+			// reasoning tokens BEFORE emitting any visible output -- the
+			// 3000 default above (sized for non-reasoning models) can be
+			// consumed entirely by reasoning over this pipeline's ~5k-token
+			// system prompt, leaving nothing for the actual JSON response
+			// (adapter returns empty text) or cutting it off mid-object
+			// (invalid JSON) -- see Pipeline.js's "empty response from
+			// adapter" / JSON.parse failures, both observed in practice
+			// with gpt-5-mini.
+			$maxOutputTokens = max($maxOutputTokens, 6000);
+		}
+
 		/**
 		 * Payload
 		 */
 		$payload = array(
 			'model' => $model,
 			'input' => $messages,
-			'max_output_tokens' => Q::ifset($options, 'max_tokens', 3000),
+			'max_output_tokens' => $maxOutputTokens,
 			'temperature' => Q::ifset($options, 'temperature', 0.5)
 		);
+
+		// Reasoning models reject a custom 'temperature' -- HTTP 400
+		// "Unsupported parameter: 'temperature' is not supported with this
+		// model." -- since they replace sampling temperature with an
+		// internal reasoning effort instead.
+		if ($isReasoningModel) {
+			unset($payload['temperature']);
+			// 'low' keeps latency down for a live-presentation assistant and
+			// leaves more of max_output_tokens for the actual visible
+			// response instead of internal deliberation -- override via
+			// options.reasoningEffort ('minimal'|'low'|'medium'|'high') if a
+			// caller needs more.
+			$payload['reasoning'] = array(
+				'effort' => Q::ifset($options, 'reasoningEffort', 'low')
+			);
+		}
 
 		/**
 		 * System instructions

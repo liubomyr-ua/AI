@@ -256,11 +256,11 @@ AI.listen = function () {
             var session = Session.get(client.id);
             if (!session) return;
             var text = data && data.text;
-            console.log('text', text)
+            //console.log('text', text)
             if (!text) return;
             var pipeline = AI._getOrCreatePipeline(session);
             var result = await pipeline.runSafebotsRequest(text);
-            console.log('result', result)
+            //console.log('result', result)
             AI._processLLMResult(session, result, {
                 speaker: session.userId,
                 relSec:  Session.relSec(session)
@@ -367,7 +367,7 @@ AI._getOrCreatePipeline = function (session) {
 
 AI._processLLMResult = function (session, result, entry) {
     if (!result) return;
-    console.log('LLM: result action', result.action);
+    //console.log('LLM: result action', result.action);
     //console.log('LLM: result visualizationType', result.visualizationType);
     //console.log('LLM: result confidence', result.confidence);
 
