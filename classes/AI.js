@@ -57,25 +57,12 @@ AI.listen = function () {
 
     // Every final utterance: run the AI pipeline for non-control narration.
     StreamsTranscript.on('processed', async function (session, result) {
-        //console.log('LLM: start', result.isControl)
-        //if (!result.isControl) {
-            if (!result.entry) return;
-            var entry = result.entry;
-            if (!session.pipeline) {
-                session.pipeline = new Pipeline({
-                    session: session,
-                });
+        if (!result.entry) return;
+        var entry = result.entry;
+        var pipeline = AI._getOrCreatePipeline(session);
+        var result = await pipeline.run(entry);
 
-                session.pipeline.on('result', function (event) {
-                    AI._processLLMResult(session, event.result, entry)
-                })
-                
-            }
-            var result = await session.pipeline.run(entry);
-
-            AI._processLLMResult(session, result, entry)
-        //}
-        //Transcript.afterStreams(session, result, AI, Q, Users);
+        AI._processLLMResult(session, result, entry)
     });
 
     // Re-broadcast session lifecycle on the AI event bus for server plugins.
@@ -257,6 +244,66 @@ AI.listen = function () {
             AI._postToolCommit(session, toolName);
         });
 
+        // ── Safebots request (wake word + command assembled client-side) ──
+        // See AI/web/js/AI/WakeWord.js: the client owns wake-word detection,
+        // accumulation, and completion timing entirely now (that's what
+        // fixed the premature-cutoff bug the old server-side timer had) and
+        // hands over one already-finished command. No buffering, no
+        // transcript-entry bookkeeping needed here — straight into the same
+        // LLM pipeline, VetoQueue, and durable-message posting a regular
+        // ambient proposal goes through.
+        client.on('AI/safebots/request', async function (data) {
+            var session = Session.get(client.id);
+            if (!session) return;
+            var text = data && data.text;
+            //console.log('text', text)
+            if (!text) return;
+            var pipeline = AI._getOrCreatePipeline(session);
+            var result = await pipeline.runSafebotsRequest(text);
+            //console.log('result', result)
+            AI._processLLMResult(session, result, {
+                speaker: session.userId,
+                relSec:  Session.relSec(session)
+            });
+        });
+
+        // ── Safebots request via Realtime API (experiment, runs alongside
+        // the text-model path above -- see AI/web/js/AI/RealtimeSafebots.js) ──
+        // Unlike 'AI/safebots/request', the Realtime model already produced
+        // the full {action, visualizationType, visualizationData, ...}
+        // answer itself, with no rolling context and no server-side LLM
+        // call in between -- this feeds the result straight into the same
+        // downstream handling (VetoQueue, ephemeral relay, coaching,
+        // durable chat post) a text-pipeline result goes through.
+        //
+        // No confidence gate here, unlike the ambient/rolling-context path:
+        // this is a direct answer to something the user explicitly asked
+        // for by saying the wake word, not a speculative suggestion offered
+        // unprompted -- even a middling-confidence answer is worth showing
+        // (still gated by host veto for 'propose' either way), whereas an
+        // ambient proposal nobody asked for should stay held back unless
+        // the model is fairly sure. See Pipeline.js's _runLLMQuery for the
+        // equivalent type-based distinction on the text-pipeline path.
+        //
+        // Trust note: because the client talks to OpenAI directly, the
+        // server has no independent way to verify this result the way it
+        // does for the text path (where the SERVER'S OWN LLM call produces
+        // the structured result). 'propose' results still require host
+        // veto before going live, same safety gate as the text path;
+        // 'coaching'/'ephemeral' results are scoped to the requesting
+        // user's own session, same as they already are for the text path.
+        client.on('AI/safebots/realtimeResult', function (data) {
+            var session = Session.get(client.id);
+            if (!session) return;
+            var result = data && data.result;
+            if (!result || typeof result !== 'object') return;
+            if (!result.action || result.action === 'none') return;
+            AI._processLLMResult(session, result, {
+                speaker: session.userId,
+                relSec:  Session.relSec(session)
+            });
+        });
+
         // ── Disconnect ─────────────────────────────────────────────────
 
         client.on('disconnect', function () {
@@ -291,9 +338,36 @@ AI.listen = function () {
 
 // ── Private helpers used by AI.listen ───────────────────────────────────────
 
+/**
+ * Lazily create session.pipeline and wire its 'result' event exactly once.
+ * 'result' fires when a call that got queued behind an in-flight one (see
+ * Pipeline._runGuarded) finally executes — its own caller already got null
+ * immediately, so this is the only place that delayed result surfaces.
+ * Shared by the ambient ('processed') path and the AI/safebots/request
+ * handler so both funnel into the same pipeline instance and the same
+ * single listener, regardless of which one happens to create it first.
+ *
+ * @method _getOrCreatePipeline
+ * @static
+ * @param {Object} session
+ * @return {Pipeline}
+ */
+AI._getOrCreatePipeline = function (session) {
+    if (!session.pipeline) {
+        session.pipeline = new Pipeline({ session: session });
+        session.pipeline.on('result', function (event) {
+            AI._processLLMResult(session, event.result, {
+                speaker: session.userId,
+                relSec:  Session.relSec(session)
+            });
+        });
+    }
+    return session.pipeline;
+};
+
 AI._processLLMResult = function (session, result, entry) {
     if (!result) return;
-    console.log('LLM: result action', result.action);
+    //console.log('LLM: result action', result.action);
     //console.log('LLM: result visualizationType', result.visualizationType);
     //console.log('LLM: result confidence', result.confidence);
 

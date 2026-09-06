@@ -8,11 +8,13 @@
  * returned token.
  *
  * Config:
- *   AI/openAI/key   — required (server-side API key)
- *   AI/openAI/baseUrl  — default https://api.openai.com
+ *   AI/openAI/key             — required (server-side API key)
+ *   AI/openAI/baseUrl         — default https://api.openai.com
+ *   AI/openAI/realTime/model    — default 'gpt-realtime-2.1-mini'
+ *   AI/openAI/realTime/tracing  — default true (see createSession() below)
  *
  * Per-call options accepted by createSession:
- *   model        — default 'gpt-realtime-2'
+ *   model        — overrides AI/openAI/realTime/model config for this call
  *   voice        — default 'alloy'
  *   instructions — system prompt
  *   audioFormat  — 'pcm16' (default)
@@ -34,7 +36,7 @@ class AI_Voice_Openai extends AI_Voice
 			: Q_Config::expect('AI', 'openAI', 'key');
 		$this->baseUrl = rtrim(isset($options['baseUrl'])
 			? $options['baseUrl']
-			: Q_Config::get(array('AI', 'openAI', 'baseUrl'), 'https://api.openai.com'), '/');
+			: Q_Config::get('AI', 'openAI', 'baseUrl', 'https://api.openai.com'), '/');
 		$this->defaults = $options;
 	}
 
@@ -45,26 +47,78 @@ class AI_Voice_Openai extends AI_Voice
 		// Merge per-call params over adapter defaults
 		$cfg = array_replace($this->defaults, $params);
 
-		$model = Q::ifset($cfg, 'model', 'gpt-realtime-2');
+		$model = Q::ifset($cfg, 'model', Q_Config::get('AI', 'openAI', 'realTime', 'model', 'gpt-realtime-2.1-mini'));
 
 		// Build the session config that the ephemeral token will be bound to.
-		// Shape per OpenAI Realtime API spec (May 2026):
+		// Wire shape per the current OpenAI Realtime API (session GA
+		// restructuring): audio settings moved off the session root into a
+		// nested audio.input / audio.output object, "modalities" was renamed
+		// "output_modalities", and audio format went from a flat shorthand
+		// string ('pcm16') to an object ({type, rate}). This adapter's own
+		// per-call option names (voice, turn_detection, audioFormat, ...)
+		// stay the same as before -- only the internal mapping below needs
+		// to track OpenAI's wire format if it changes again.
 		//   POST /v1/realtime/client_secrets
-		//   body: { session: { type, model, voice, instructions, ... } }
+		//   body: { session: { type, model, instructions, output_modalities,
+		//                       tools, tool_choice, audio: {input, output} } }
 		$session = array(
 			'type'  => 'realtime',
 			'model' => $model
 		);
-		if (isset($cfg['voice']))          $session['voice']          = $cfg['voice'];
-		if (isset($cfg['instructions']))   $session['instructions']   = $cfg['instructions'];
-		if (isset($cfg['turn_detection'])) $session['turn_detection'] = $cfg['turn_detection'];
-		if (isset($cfg['tools']))          $session['tools']          = $cfg['tools'];
+		if (isset($cfg['instructions']))   $session['instructions']      = $cfg['instructions'];
+		if (isset($cfg['tools']))          $session['tools']             = $cfg['tools'];
+		if (isset($cfg['tool_choice']))    $session['tool_choice']       = $cfg['tool_choice'];
+		if (isset($cfg['modalities']))     $session['output_modalities'] = $cfg['modalities'];
 
-		// Audio format/sample-rate go in input_audio_format / output_audio_format
-		// per OpenAI's spec; the adapter normalizes shorthand.
+		// Session tracing -- lets a session's activity show up on the
+		// Realtime API Logs dashboard (platform.openai.com/logs?api=realtime).
+		// "auto" turns it on with default workflow/group/metadata; null
+		// turns it off. Defaults on via AI/openAI/realTime/tracing config,
+		// overridable per call via $cfg['tracing'] (true/false, or already-
+		// "auto"/null/a granular {group_id, metadata, workflow_name} object).
+		$tracing = array_key_exists('tracing', $cfg)
+			? $cfg['tracing']
+			: Q_Config::get('AI', 'openAI', 'realTime', 'tracing', true);
+		if ($tracing === true) {
+			$session['tracing'] = 'auto';
+		} elseif ($tracing === false) {
+			$session['tracing'] = null;
+		} else {
+			$session['tracing'] = $tracing; // already "auto" / null / a granular object
+		}
+
 		$audioFormat = Q::ifset($cfg, 'audioFormat', 'pcm16');
-		$session['input_audio_format']  = $audioFormat;
-		$session['output_audio_format'] = $audioFormat;
+		$sampleRate  = Q::ifset($cfg, 'sampleRate', 24000);
+		// Only 'pcm16' (this adapter's only shorthand so far) is normalized
+		// to the new {type, rate} shape; an already-object format passes
+		// through unchanged for forward compatibility.
+		$inputFormat  = is_array($audioFormat) ? $audioFormat : array('type' => 'audio/pcm', 'rate' => $sampleRate);
+		// Output requires "rate" too -- the API rejects output.format
+		// without one, even though the docs' own example omits it.
+		$outputFormat = is_array($audioFormat) ? $audioFormat : array('type' => 'audio/pcm', 'rate' => $sampleRate);
+
+		$audioInput = array('format' => $inputFormat);
+		// array_key_exists, not isset -- turn_detection:null is a meaningful
+		// value (disables VAD for manual/push-to-talk turn control), and
+		// isset() treats an explicit null the same as "not passed at all".
+		if (array_key_exists('turn_detection', $cfg)) $audioInput['turn_detection'] = $cfg['turn_detection'];
+		if (isset($cfg['input_audio_transcription']))  $audioInput['transcription']  = $cfg['input_audio_transcription'];
+
+		$audio = array('input' => $audioInput);
+
+		// Skip audio.output entirely when the caller only wants text back
+		// (e.g. Safebots' report_visualization flow) -- there's no spoken
+		// reply to configure a format/voice for, and this is also one fewer
+		// thing that can fail the request's schema validation.
+		$modalities = isset($cfg['modalities']) ? (array)$cfg['modalities'] : null;
+		$wantsAudioOut = !$modalities || in_array('audio', $modalities);
+		if ($wantsAudioOut) {
+			$audioOutput = array('format' => $outputFormat);
+			if (isset($cfg['voice'])) $audioOutput['voice'] = $cfg['voice'];
+			$audio['output'] = $audioOutput;
+		}
+
+		$session['audio'] = $audio;
 
 		$headers = array(
 			'Content-Type: application/json',
@@ -75,14 +129,17 @@ class AI_Voice_Openai extends AI_Voice
 			$headers[] = 'OpenAI-Safety-Identifier: ' . $cfg['safetyIdentifier'];
 		}
 
+		// Q_Utils::post($url, $data, $user_agent, $curl_opts, $header, $timeout, ...)
+		// -- $curl_opts keys must be real CURLOPT_* constants (it's merged
+		// straight into curl_setopt_array()); headers and timeout have their
+		// own dedicated params instead.
 		$response = Q_Utils::post(
 			$this->baseUrl . '/v1/realtime/client_secrets',
 			array('session' => $session),
 			null,
-			array(
-				'CURLOPT_HTTPHEADER' => $headers,
-				'CURLOPT_TIMEOUT'    => 15
-			)
+			array(),
+			$headers,
+			15
 		);
 
 		if (!$response) {
@@ -117,7 +174,13 @@ class AI_Voice_Openai extends AI_Voice
 			'model'     => $model,
 			'expiresAt' => $expiresAt,
 			'mode'      => 'direct',
-			'session'   => isset($decoded['session']) ? $decoded['session'] : $session
+			// Always our own constructed $session, never $decoded['session']:
+			// the client resends this verbatim as the `session.update` event
+			// payload once connected (see AI.Voice.OpenaiRealtime's dc.onopen),
+			// but OpenAI's client_secrets response echoes back a full session
+			// RESOURCE representation -- with server-generated fields like
+			// "object" -- that session.update's event schema rejects.
+			'session'   => $session
 		);
 	}
 }

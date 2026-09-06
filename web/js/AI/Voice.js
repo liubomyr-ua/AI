@@ -48,6 +48,9 @@
 	} else {
 		root.AI = root.AI || {};
 		root.AI.Voice = factory();
+		if (typeof Q !== 'undefined' && Q.exports) {
+			Q.exports(root.AI.Voice);
+		}
 	}
 }(typeof self !== 'undefined' ? self : this, function () {
 	'use strict';
@@ -93,32 +96,49 @@
 	};
 
 	/**
-	 * Establish the session connection. Returns a Promise that resolves
-	 * when the session is open (after session.update ack on OpenAI-style,
-	 * setupComplete on Gemini).
+	 * Lazily create the protocol impl and bridge its events, without
+	 * connecting. Split out of connect() so startMicrophone() can be called
+	 * BEFORE connect() -- needed to pre-warm a WebRTC session: the mic track
+	 * has to be added to the peer connection before the initial SDP offer is
+	 * created, since (at least for OpenAI's one-shot SDP exchange) there's
+	 * no renegotiation endpoint to add it afterwards.
+	 * @private
 	 */
-	Voice.prototype.connect = function () {
-		var self = this;
+	Voice.prototype._ensureImpl = function () {
+		if (this._impl) return this._impl;
 		if (!this.protocolName) {
-			return Promise.reject(new Error('AI.Voice: session.protocol missing'));
+			throw new Error('AI.Voice: session.protocol missing');
 		}
 		var Cls = protocols[this.protocolName];
 		if (!Cls) {
-			return Promise.reject(new Error('AI.Voice: protocol "' + this.protocolName
-				+ '" not registered. Registered: ' + Object.keys(protocols).join(', ')));
+			throw new Error('AI.Voice: protocol "' + this.protocolName
+				+ '" not registered. Registered: ' + Object.keys(protocols).join(', '));
 		}
 		this._impl = new Cls(this.session);
 
 		// Bridge events from the protocol impl to our public emitter.
+		var self = this;
 		['open', 'close', 'error', 'audio', 'transcript', 'toolCall',
-		 'turnStart', 'turnEnd', 'sessionUpdated'].forEach(function (evt) {
+		 'turnStart', 'turnEnd', 'sessionUpdated', 'responseDone'].forEach(function (evt) {
 			self._impl.on(evt, function () {
 				var args = [evt].concat(Array.prototype.slice.call(arguments));
 				self.emit.apply(self, args);
 			});
 		});
+		return this._impl;
+	};
 
-		return this._impl.connect().then(function () {
+	/**
+	 * Establish the session connection. Returns a Promise that resolves
+	 * when the session is open (after session.update ack on OpenAI-style,
+	 * setupComplete on Gemini). Safe to call after startMicrophone() has
+	 * already run (the impl already exists, this just connects it).
+	 */
+	Voice.prototype.connect = function () {
+		var self = this;
+		var impl;
+		try { impl = this._ensureImpl(); } catch (e) { return Promise.reject(e); }
+		return impl.connect().then(function () {
 			self._connected = true;
 		});
 	};
@@ -126,10 +146,40 @@
 	/**
 	 * Start capturing microphone audio and forwarding to the session.
 	 * Returns a Promise that resolves when the audio capture is running.
+	 * Can be called BEFORE connect() (see _ensureImpl) -- the recommended
+	 * order for WebRTC pre-warming: acquire + mute the mic first, then
+	 * connect() so the initial offer already includes the audio track.
+	 *
+	 * @param {Object|MediaStreamTrack} [input]  getUserMedia() constraints
+	 *   (default), or an existing MediaStreamTrack to use directly instead
+	 *   of opening a new, independent microphone capture -- see each
+	 *   protocol impl's startMicrophone() for how the track is handled.
 	 */
-	Voice.prototype.startMicrophone = function (constraints) {
-		if (!this._impl) return Promise.reject(new Error('AI.Voice: not connected'));
-		return this._impl.startMicrophone(constraints || { audio: true });
+	Voice.prototype.startMicrophone = function (input) {
+		var impl;
+		try { impl = this._ensureImpl(); } catch (e) { return Promise.reject(e); }
+		return impl.startMicrophone(input || { audio: true });
+	};
+
+	/**
+	 * Mute/unmute the already-added microphone track without renegotiating
+	 * the connection. Use this to gate what audio actually reaches the
+	 * model (e.g. only while a wake word is open) instead of adding/removing
+	 * tracks after the connection is established.
+	 */
+	Voice.prototype.setMicEnabled = function (enabled) {
+		if (!this._impl || !this._impl.setMicEnabled) return;
+		this._impl.setMicEnabled(enabled);
+	};
+
+	/**
+	 * Manually commit the input audio buffer. Only meaningful when the
+	 * session was configured with turn_detection:null (manual/push-to-talk
+	 * mode) -- with server VAD this happens automatically.
+	 */
+	Voice.prototype.commitAudio = function () {
+		if (!this._impl) throw new Error('AI.Voice: not connected');
+		if (this._impl.commitAudio) this._impl.commitAudio();
 	};
 
 	Voice.prototype.stopMicrophone = function () {
@@ -146,10 +196,30 @@
 	};
 
 	/**
-	 * Respond to a tool call from the model.
+	 * Respond to a tool call from the model, then let it continue the
+	 * conversation with a new turn (the right default when the caller wants
+	 * the model to say something back after the tool call). For a
+	 * single-shot "the tool call IS the answer, nothing more to say" flow,
+	 * use sendFunctionCallOutput() instead -- this method's automatic
+	 * continuation would otherwise make the model call the tool again.
 	 */
 	Voice.prototype.respondToToolCall = function (callId, result) {
 		if (!this._impl) throw new Error('AI.Voice: not connected');
+		return this._impl.respondToToolCall(callId, result);
+	};
+
+	/**
+	 * Send a function call's output without automatically continuing the
+	 * conversation with another model turn. See respondToToolCall() for
+	 * when to use which.
+	 */
+	Voice.prototype.sendFunctionCallOutput = function (callId, result) {
+		if (!this._impl) throw new Error('AI.Voice: not connected');
+		if (this._impl.sendFunctionCallOutput) {
+			return this._impl.sendFunctionCallOutput(callId, result);
+		}
+		// Fallback for a protocol impl that hasn't defined the non-chaining
+		// variant -- better to over-continue than to silently do nothing.
 		return this._impl.respondToToolCall(callId, result);
 	};
 

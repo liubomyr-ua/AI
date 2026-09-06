@@ -31,6 +31,28 @@ AI_LLM.Openai.prototype.constructor = AI_LLM.Openai;
 AI_LLM.Openai.prototype.supportsWebSearch = function () { return true; };
 
 /**
+ * OpenAI's reasoning-model family: o1/o3/o4-series, and gpt-5 as of its
+ * launch. Detected by model name prefix so callers/config don't need to
+ * know which models this affects.
+ * @private
+ * @param {string} model
+ */
+AI_LLM.Openai.prototype._isReasoningModel = function (model) {
+	return /^(o[1-9](-|$)|gpt-5)/.test(model || '');
+};
+
+/**
+ * Reasoning models reject a custom 'temperature' -- HTTP 400 "Unsupported
+ * parameter: 'temperature' is not supported with this model." -- since they
+ * replace sampling temperature with an internal reasoning effort instead.
+ * @private
+ * @param {string} model
+ */
+AI_LLM.Openai.prototype._supportsTemperature = function (model) {
+	return !this._isReasoningModel(model);
+};
+
+/**
  * Build the web_search tool entry for the Responses API payload.
  * Uses "web_search" (current) with web_search_preview as silent fallback
  * for models that don't yet support the newer name.
@@ -63,7 +85,19 @@ AI_LLM.Openai.prototype.executeModel = function (instructions, inputs, options) 
 	var apiKey      = options.apiKey      || this.apiKey;
 	if (!apiKey) return Promise.reject(new Error('AI.LLM.Openai: missing API key (AI/openAI/key)'));
 
+	var isReasoning = self._isReasoningModel(model);
 	var maxTokens   = options.max_tokens  || 3000;
+	if (isReasoning && !options.max_tokens) {
+		// Reasoning models spend part of max_output_tokens on hidden
+		// reasoning tokens BEFORE emitting any visible output. The 3000
+		// default above (sized for non-reasoning models) can be consumed
+		// entirely by reasoning over this pipeline's ~5k-token system
+		// prompt, leaving nothing for the actual JSON response (adapter
+		// returns empty text) or cutting it off mid-object (invalid JSON) --
+		// see Pipeline.js's "empty response from adapter" / JSON.parse
+		// failures, both observed in practice with gpt-5-mini.
+		maxTokens = Math.max(maxTokens, 6000);
+	}
 	var temperature = options.temperature != null ? options.temperature : 0.5;
 	var messages    = options.messages    || [];
 
@@ -98,6 +132,16 @@ AI_LLM.Openai.prototype.executeModel = function (instructions, inputs, options) 
 		max_output_tokens: maxTokens,
 		temperature:       temperature
 	};
+	if (!self._supportsTemperature(model)) {
+		delete payload.temperature;
+	}
+	if (isReasoning) {
+		// 'low' keeps latency down for a live-presentation assistant and
+		// leaves more of max_output_tokens for the actual visible response
+		// instead of internal deliberation -- override via options.reasoningEffort
+		// ('minimal' | 'low' | 'medium' | 'high') if a caller needs more.
+		payload.reasoning = { effort: options.reasoningEffort || 'low' };
+	}
 	if (instructions) payload.instructions = instructions;
 
 	// ── Structured output — Responses API ──────────────────────────────────────
