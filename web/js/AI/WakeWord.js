@@ -25,12 +25,26 @@
  *   'command'        (text)         -- the finished "Safebots, ..." request,
  *                                      ready to hand off to the AI pipeline
  *
+ * procesTranscriptEvent() also RETURNS the ambient-safe leftover of the fed
+ * event -- whatever text isn't part of an open or just-finished wake command
+ * (e.g. "and next, let's look at Q3 earnings" trailing after a "...thanks"
+ * that closed a command, or narration before a "Hey Safebots" that opens
+ * one) -- as a {transcript, isFinal, confidence, latestFinalAt} object ready
+ * for Q.Streams.Transcript.send(), or null when this event contributed
+ * nothing but command text. Callers that want the regular ambient/rolling
+ * transcript pipeline to never see wake-word command text (so it can't
+ * duplicate a wake-triggered proposal as an ambient one -- see
+ * Media/presentation/commands.js's _connectWakeWord) should forward this
+ * return value instead of also handing Q.Speech.Recognition results to
+ * Q.Streams.Transcript directly.
+ *
  * Usage:
  *   Q.require(Q.url('{{AI}}/js/AI/WakeWord.js'), function (WakeWord) {
  *       var ww = new WakeWord();
  *       ww.on('command', function (text) { ... });
  *       Q.Speech.Recognition.onResult.set(function (e) {
- *           ww.procesTranscriptEvent(e);
+ *           var ambientChunk = ww.procesTranscriptEvent(e);
+ *           if (ambientChunk) Q.Streams.Transcript.send(ambientChunk);
  *       }, 'MyTool');
  *   });
  *
@@ -246,7 +260,46 @@
 			speaker: Q.Users.loggedInUserId()
 		};
 
-		self.updateBuffer(chunkData);
+		return self.updateBuffer(chunkData);
+	};
+
+	/**
+	 * Pull the ambient-safe leftover out of an entry after
+	 * processUtteranceWithWakeWord has (possibly) marked it with
+	 * __WAKESTART__/__WAKEEND__ sentinels: narration before __WAKESTART__ on
+	 * a wake-start entry, narration after __WAKEEND__ on a wake-end entry.
+	 * An entry that's neither (a pure mid-command entry) contributes nothing.
+	 * @param {*} entry
+	 */
+	WakeWord.prototype._extractAmbientText = function (entry) {
+		var text = entry.text || '';
+		var parts = [];
+		if (entry.isWakeUpStartEntry) {
+			var before = text.match(/^([\s\S]*?)__WAKESTART__/);
+			if (before && before[1].trim()) parts.push(before[1].trim());
+		}
+		if (entry.isWakeUpEndEntry) {
+			var after = text.match(/__WAKEEND__([\s\S]*)$/);
+			if (after && after[1].trim()) parts.push(after[1].trim());
+		}
+		return parts.join(' ');
+	};
+
+	/**
+	 * Shape an ambient-safe leftover as the chunk object
+	 * Q.Streams.Transcript.send() expects. Returns null for empty text so
+	 * callers can skip forwarding a no-op chunk.
+	 * @param {*} entry
+	 * @param {string} text
+	 */
+	WakeWord.prototype._buildAmbientChunk = function (entry, text) {
+		if (!text || !text.trim()) return null;
+		return {
+			transcript: text.trim(),
+			isFinal: !!entry.isFinal,
+			confidence: entry.confidence,
+			latestFinalAt: entry.latestFinalAt
+		};
 	};
 
 	/**
@@ -255,7 +308,11 @@
 	 * so interim growth of one utterance updates the SAME entry object
 	 * rather than piling up duplicates), then run it through wake-word
 	 * detection. Emits 'command' with the finished "Safebots, ..." request
-	 * once a wake sequence completes.
+	 * once a wake sequence completes, and returns whatever's left of this
+	 * entry that ISN'T wake-command text (see _extractAmbientText), so a
+	 * caller can forward genuine narration to the ambient transcript
+	 * pipeline without also duplicating the wake command into it.
+	 * @return {Object|null}
 	 */
 	WakeWord.prototype.updateBuffer = function (entry) {
 		if (!entry.text) return null;
@@ -281,7 +338,7 @@
 			} else {
 				entryToUpdate.text = text;
 			}
-			
+
 			if (entry.isFinal) {
                 entryToUpdate.isFinal = true;
             }
@@ -292,14 +349,23 @@
 		}
 
 		var wakeRequest = this.processUtteranceWithWakeWord(entry);
-		if (wakeRequest === true) {
-			return; // still listening — no finished command yet
+		if (wakeRequest === false) {
+			// No wake context at all -- the whole entry is ambient narration.
+			return this._buildAmbientChunk(entry, entry.text);
+		} else if (wakeRequest === true) {
+			// Still consuming the command -- forward only a wake-start
+			// entry's leading narration, if any; mid-command entries have
+			// nothing ambient to contribute.
+			return this._buildAmbientChunk(entry, this._extractAmbientText(entry));
 		} else if (typeof wakeRequest == 'string') {
 			if (entry.wakeUpTextLength != null) {
 				entry.wakeUpTextLength = entry.wakeUpTextLength + text.length;
 			}
+			var ambientChunk = this._buildAmbientChunk(entry, this._extractAmbientText(entry));
 			this.emit('command', wakeRequest);
+			return ambientChunk;
 		}
+		return null;
 	};
 
 	/**
