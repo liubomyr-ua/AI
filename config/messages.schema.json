@@ -1055,9 +1055,9 @@
 			}
 		},
 		"slide": {
-			"description": "AI-composed HTML slide with optional build-in animations. Use when you have an image from web search AND want layout control, or for news stories with hero image + text, or multiple images side by side. Write full HTML + inline <style> scoped to .Media_presentation_slide_tool. Embed images with <img src=\"URL\" onerror=\"this.style.display='none'\">. Animate elements with data-build=\"N\" data-build-effect=\"rise|dissolve|slideLeft|slideRight|scale\".",
+			"description": "AI-composed HTML slide with optional build-in animations. Use when you have an image from web search AND want layout control, or for news stories with hero image + text, or multiple images side by side. Write full HTML + inline <style>, but ONLY reference elements/classes you create yourself in this same HTML -- tag selectors like h1/p/ul/li/img, or a class name you invent and place on your own wrapping <div>. NEVER reference .Media_slide_content, .Media_presentation_slide_tool, or any other name you did not write in this HTML -- those belong to the app around your slide, not to your content, so a rule targeting them will not do what you expect (it will not touch YOUR elements at all). To lay out multiple elements (e.g. a 2-column grid), wrap them in your own <div class=\"your-own-class-name\"> and put the layout rule on that class. Embed images with <img src=\"URL\" onerror=\"this.style.display='none'\">. Animate elements with data-build=\"N\" data-build-effect=\"rise|dissolve|slideLeft|slideRight|scale\".",
 			"example": {
-				"html": "<style>.Media_presentation_slide_tool{display:grid;grid-template-columns:1fr 1fr;gap:2rem;padding:2.5rem;background:#111;color:#fff}</style><img src=\"https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/YannLeCun.jpg/440px-YannLeCun.jpg\" style=\"width:100%;border-radius:8px;object-fit:cover;height:280px\" data-build=\"1\" data-build-effect=\"dissolve\" onerror=\"this.style.display='none'\"><div data-build=\"2\" data-build-effect=\"rise\"><h1 style=\"margin:0 0 .5rem;font-size:2rem\">Yann LeCun</h1><p style=\"color:#aaa;line-height:1.6\">Chief AI Scientist at Meta. Creator of convolutional networks. Critic of LLMs as path to AGI.</p></div>",
+				"html": "<style>.yl-slide{display:grid;grid-template-columns:1fr 1fr;gap:2rem;padding:2.5rem;background:#111;color:#fff}</style><div class=\"yl-slide\"><img src=\"https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/YannLeCun.jpg/440px-YannLeCun.jpg\" style=\"width:100%;border-radius:8px;object-fit:cover;height:280px\" data-build=\"1\" data-build-effect=\"dissolve\" onerror=\"this.style.display='none'\"><div data-build=\"2\" data-build-effect=\"rise\"><h1 style=\"margin:0 0 .5rem;font-size:2rem\">Yann LeCun</h1><p style=\"color:#aaa;line-height:1.6\">Chief AI Scientist at Meta. Creator of convolutional networks. Critic of LLMs as path to AGI.</p></div></div>",
 				"buildAuto": true,
 				"buildStagger": 500,
 				"credit": "Wikipedia / Meta"
@@ -1067,7 +1067,7 @@
 				"html": {
 					"required": true,
 					"type": "string",
-					"description": "Full HTML + optional inline <style> scoped to .Media_presentation_slide_tool. Embed images with <img src=\"URL\" onerror=\"this.style.display='none'\">. Animate elements with data-build=\"N\" data-build-effect=\"rise|dissolve|slideLeft|slideRight|scale\"."
+					"description": "Full HTML + optional inline <style>. Only reference elements/classes you create yourself in this HTML -- tag selectors (h1, p, ul, li, img) or a class name you invent and place on your own <div> -- never .Media_slide_content, .Media_presentation_slide_tool, or any other name you did not write here; those belong to the app around your slide and referencing them will not style your own elements. Embed images with <img src=\"URL\" onerror=\"this.style.display='none'\">. Animate elements with data-build=\"N\" data-build-effect=\"rise|dissolve|slideLeft|slideRight|scale\"."
 				},
 				"buildAuto": {
 					"required": false,

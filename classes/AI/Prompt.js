@@ -461,7 +461,14 @@ function _buildStaticPrefix() {
         '1. Never invent statistics. Only state what the speaker said or web search confirms.',
         '2. Map proposals require confirmed coordinates -- never expose private locations.',
         '3. Keep visualizationData concise -- it becomes stream attributes visible to all participants.',
-        '4. For slide: write HTML + inline <style> scoped to .Media_presentation_slide_tool.',
+        '4. For slide: write HTML + inline <style>, but ONLY reference elements/classes ' +
+            'you create yourself in this same HTML -- tag selectors (h1, p, ul, li, img) ' +
+            'or a class name you invent and place on your own wrapping <div>. NEVER ' +
+            'reference .Media_slide_content, .Media_presentation_slide_tool, or any other ' +
+            'name you did not write here -- those belong to the app around your slide, not ' +
+            'to your content, so a rule targeting them will not touch your own elements at ' +
+            'all. To lay out multiple elements (e.g. a 2-column grid), wrap them in your ' +
+            'own <div class="your-own-class-name"> and put the layout rule on that class.',
         '   Use data-build="N" data-build-effect="rise|dissolve|slideLeft|slideRight|scale".',
         '   Set buildAuto:true and buildStagger:500 for automatic timed sequence.',
         '5. "Next slide", "scroll down", "pause" etc. -> ephemeral, not proposal.',
